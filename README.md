@@ -1,8 +1,8 @@
 # Copilot Summary Optimizer — Genesys Cloud Summary Prompt Testing Pipeline
 
-A tooling bundle for developing, testing, and iteratively improving **Genesys Cloud Agent Copilot / AI Studio summary prompts**. It works in **Kiro** and in **Cursor**.
+A tooling bundle for developing, testing, and iteratively improving Genesys Cloud Agent Copilot / AI Studio summary prompts. It works in Kiro and in Cursor.
 
-It ships an MCP server plus the pipeline guidance the agent needs to orchestrate the whole workflow — fetching transcripts, authoring requirements and test cases, running evaluations, generating dashboards, and iterating on prompts — through natural language.
+It ships an MCP server plus the pipeline guidance the agent needs to orchestrate...
 
 ---
 
