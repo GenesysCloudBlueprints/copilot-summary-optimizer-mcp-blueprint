@@ -136,9 +136,9 @@ The two tools that write to live Genesys Cloud, `update_summary_setting` and `up
 
 ## Additional resources
 
-* [Agent Copilot overview](https://help.genesys.cloud/articles/about-agent-copilot/ "Goes to the About Agent Copilot article") in the Genesys Cloud Resource Center
-* [Genesys Cloud Platform API](https://developer.genesys.cloud/api/rest/ "Goes to the Platform API page") in the Genesys Cloud Developer Center
-* [OAuth with Authorization Code Grant](https://developer.genesys.cloud/authorization/platform-auth/use-pkce "Goes to the PKCE grant page") in the Genesys Cloud Developer Center
+* [About Genesys Agent Copilot](https://help.genesys.cloud/articles/about-genesys-agent-copilot/ "Goes to the About Genesys Agent Copilot article") in the Genesys Cloud Resource Center
+* [Platform API overview](https://developer.genesys.cloud/platform/api/ "Goes to the Platform API overview page") in the Genesys Cloud Developer Center
+* [Grant - Proof Key for Code Exchange (PKCE)](https://developer.genesys.cloud/authorization/platform-auth/use-pkce "Goes to the PKCE grant page") in the Genesys Cloud Developer Center
 * [Model Context Protocol specification](https://modelcontextprotocol.io "Goes to the Model Context Protocol site")
 * Repository guides: `docs/setup.md`, `docs/oauth-setup.md`, `docs/workflow.md`, `docs/eval-guide.md`, `docs/requirements-guide.md`, and `docs/test-case-guide.md`
 * [copilot-summary-optimizer-mcp-blueprint](https://github.com/GenesysCloudBlueprints/copilot-summary-optimizer-mcp-blueprint "Goes to the repository") repository in GitHub
