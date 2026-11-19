@@ -1,0 +1,53 @@
+# ─── Local editor state — never committed ─────────────────────────────────────
+# Deployed/editor-local configuration for THIS repo, produced either by running
+# deploy.js against the repo itself or just by opening it in the editor. It is
+# machine-specific, can contain absolute paths, and historically contained
+# credentials.
+#
+# Patterns are ANCHORED with a leading slash, which matters here:
+#   /.kiro/          ignores local Kiro state  — but NOT `kiro/`, which holds the
+#                    agent templates and eval-orchestration text the Kiro deploy
+#                    reads and which MUST stay committed.
+#   /.cursor/        ignores local Cursor state — but NOT `.cursor-plugin/`,
+#                    which is the plugin manifest and MUST stay committed.
+#
+# NOTE: the repo-root mcp.json is the canonical server definition and tool
+# allowlist. It is intentionally committed — it holds only placeholders, never
+# credentials.
+/.kiro/
+/.cursor/
+.env
+.env.local
+
+# ─── Runtime credential and token storage ─────────────────────────────────────
+# Written by the MCP server at login time. Contains bearer tokens and client IDs.
+# Covered at BOTH the repo root and mcp-server/ (server may write to either
+# location depending on its working directory when started).
+.copilot-summary-optimizer/
+mcp-server/.copilot-summary-optimizer/
+
+# ─── Node build output and dependencies ───────────────────────────────────────
+# dist/ is the local tsc output, used for type-checking and debugging only.
+# mcp-server/bundle/ is deliberately NOT ignored: nothing on the consuming side
+# ever runs a build — deploy.js vendors the bundle straight into the target
+# project, and a Cursor plugin install clones the repo without building — so the
+# bundled server must be committed or there is nothing to run.
+mcp-server/dist/
+mcp-server/node_modules/
+
+# ─── Summary config lifecycle data ───────────────────────────────────────────
+# Contains customer transcripts (PII), eval runs, test data, and credentials.
+# Nothing under this directory should ever be committed.
+.summaryconfig-lifecycle/
+
+# ─── Local archive (contains credentials, test data, build artifacts) ─────────
+archived/
+
+# ─── macOS ────────────────────────────────────────────────────────────────────
+.DS_Store
+**/.DS_Store
+
+# Rendered report previews from fixture data (npm run preview:reports)
+mcp-server/.reports-preview/
+
+handoff.md
