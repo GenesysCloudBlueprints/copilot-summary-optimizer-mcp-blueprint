@@ -1,0 +1,53 @@
+{
+  "mcpServers": {
+    "copilot-summary-optimizer": {
+      "command": "node",
+      "args": [
+        "${CURSOR_PLUGIN_ROOT}/mcp-server/bundle/copilot-summary-optimizer-mcp.mjs"
+      ],
+      "env": {
+        "COPILOT_SUMMARY_HOST": "cursor",
+        "COPILOT_SUMMARY_STORAGE_PATH": "${workspaceFolder}/.copilot-summary-optimizer",
+        "COPILOT_SUMMARY_LIFECYCLE_PATH": "${workspaceFolder}/summaryconfig-lifecycle"
+      },
+      "alwaysAllow": [
+        "get_pipeline_guide",
+        "connect",
+        "login",
+        "complete_login",
+        "smoke_test_auth",
+        "build_interaction_filter",
+        "search_conversations",
+        "fetch_transcript",
+        "fetch_transcripts_bulk",
+        "fetch_existing_summaries_bulk",
+        "get_existing_summaries",
+        "list_transcripts",
+        "list_summary_settings",
+        "get_summary_setting",
+        "list_assistants",
+        "get_copilot_config",
+        "generate_preview_summary",
+        "generate_test_case",
+        "save_test_case",
+        "list_test_cases",
+        "save_test_set",
+        "list_test_sets",
+        "prepare_prompt_test",
+        "start_eval_run",
+        "get_eval_batch",
+        "submit_eval_scores",
+        "finalize_eval_run",
+        "list_eval_runs",
+        "save_version",
+        "list_versions",
+        "save_improvement_recommendations",
+        "generate_eval_run_dashboard",
+        "generate_improvements_dashboard",
+        "generate_rollup_report",
+        "regenerate_reports",
+        "get_pipeline_state"
+      ]
+    }
+  }
+}

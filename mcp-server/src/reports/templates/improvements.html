@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<!--
+  Improvements report — run-over-run performance for one test set.
+
+  Static chrome lives here so it can be edited as HTML; the views are rendered from the
+  embedded model by improvements.js. Run dashboards are linked relatively, so the whole
+  eval-runs folder can be copied and the links still resolve.
+-->
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{{PAGE_TITLE}}</title>
+<style>{{STYLES}}</style>
+</head>
+<body>
+<div class="page">
+
+  <section class="hero">
+    <div class="hero-top">
+      <div class="eyebrow" id="eyebrow">Improvements &middot; run over run</div>
+      <div class="hero-stamp"><i class="live-dot" id="stampdot"></i><span id="stamptext"></span></div>
+    </div>
+    <div class="hero-grid">
+      <div>
+        <h1 id="title"></h1>
+        <p class="sub" id="subtitle"></p>
+        <div class="hero-tags" id="chips"></div>
+      </div>
+      <div class="dial" id="dial">
+        <div class="dial-face">
+          <span class="dial-num" id="dialnum"></span>
+          <span class="dial-lab" id="diallab">Latest pass rate</span>
+          <span class="dial-sub" id="dialsub"></span>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <nav class="tabs">
+    <button class="tab active" data-tab="overview" onclick="go('/')">Overview</button>
+    <button class="tab" data-tab="changelog" onclick="go('/changelog')">Changelog <span class="count" id="tab-counts-changelog"></span></button>
+    <button class="tab" data-tab="testcases" onclick="go('/testcases')">Test cases <span class="count" id="tab-counts-testcases"></span></button>
+    <button class="tab" data-tab="requirements" onclick="go('/requirements')">Requirements <span class="count" id="tab-counts-requirements"></span></button>
+  </nav>
+
+  <main id="body"></main>
+
+  <div class="foot" id="foot"></div>
+</div>
+
+<script type="application/json" id="report-model">{{MODEL}}</script>
+<script>{{SHARED}}</script>
+<script>{{VIEWER}}</script>
+</body>
+</html>

@@ -1,0 +1,3516 @@
+import { v4 as uuidv4 } from "uuid";
+import { saveGenesysConfig, getGenesysConfig, loadConfig, SUMMARY_MODEL_NAME } from "../config.js";
+import { FULL_PIPELINE_GUIDE } from "../pipelineGuide.js";
+import { spawnInstructionBrief } from "../host.js";
+import type { GenesysConfig } from "../types.js";
+import { clearTokenCache, clearUserToken, startLoginFlow, preparePkceLogin, completePkceLogin, getUserToken, TokenExpiredError } from "../genesys/auth.js";
+import * as storage from "../storage.js";
+import { searchConversations } from "../genesys/analytics.js";
+import {
+  fetchAndTransformTranscript,
+  fetchMessagingTranscript,
+  normaliseManualTranscript,
+  resolveCustomerCommunicationId,
+} from "../genesys/transcripts.js";
+import {
+  listSummarySettings,
+  getSummarySetting,
+  createSummarySetting,
+  updateSummarySetting,
+  generatePreviewSummary,
+  extractSummaryText,
+  getExistingSummaries,
+  isTooShortToSummarise,
+  TOO_SHORT_SUMMARY_MESSAGE,
+} from "../genesys/summaries.js";
+import { listAssistants, getCopilotConfig, updateCopilotConfig, getAssistantQueues } from "../genesys/copilot.js";
+import { buildImprovementsReport, buildRollupReport, buildRunReport } from "../reports/build.js";
+import { loadRequirements } from "../reports/requirements.js";
+import { renderImprovementsReport, renderRollupReport, renderRunReport } from "../reports/render.js";
+import type {
+  SummarySetting,
+  StoredTranscript,
+  TestCase,
+  TestSet,
+  EvalRunMeta,
+  EvalRunPendingMeta,
+  EvalRunResult,
+  SkippedTranscript,
+} from "../types.js";
+
+type Args = Record<string, unknown>;
+
+function str(args: Args, key: string): string {
+  const v = args[key];
+  if (typeof v !== "string") throw new Error(`Missing required string argument: ${key}`);
+  return v;
+}
+
+function optStr(args: Args, key: string): string | undefined {
+  const v = args[key];
+  return typeof v === "string" ? v : undefined;
+}
+
+function strArr(args: Args, key: string): string[] {
+  const v = args[key];
+  if (!Array.isArray(v)) throw new Error(`Missing required array argument: ${key}`);
+  return v.map((x) => String(x));
+}
+
+function ok(content: string) {
+  return { content: [{ type: "text" as const, text: content }] };
+}
+
+function json(data: unknown) {
+  return ok(JSON.stringify(data, null, 2));
+}
+
+/**
+ * Wraps a handler body. If the call throws TokenExpiredError the wrapper:
+ *   1. Checks for a stored lastAuthorizationUrl and auto-starts the browser login.
+ *   2. Returns a clear message asking the user to log in and retry.
+ */
+async function withTokenRefresh<T>(
+  fn: () => Promise<T>,
+): Promise<T | ReturnType<typeof ok>> {
+  try {
+    return await fn();
+  } catch (err) {
+    if (!(err instanceof TokenExpiredError)) throw err;
+
+    const storedConfig = loadConfig().genesys;
+    const authUrl = storedConfig?.lastAuthorizationUrl;
+
+    if (authUrl && storedConfig) {
+      // Auto-restart the login flow using the stored Authorization URL
+      try {
+        const { authUrl: loginUrl } = preparePkceLogin(storedConfig);
+        return ok(
+          `─── Session Expired ───\n\n` +
+          `Your Genesys session has expired. Your browser has been opened to log in again.\n` +
+          `If it didn't open, use this URL:\n\n` +
+          `  ${loginUrl}\n\n` +
+          `Once you see the "Logged in to Genesys Cloud ✓" page, tell me and I'll complete the login.\n` +
+          `Then retry your original request.`,
+        ) as T;
+      } catch {
+        // Browser open failed — still tell user what to do
+      }
+    }
+
+    return ok(
+      `─── Session Expired ───\n\n` +
+      `Your Genesys session has expired. Paste your Authorization URL to log in again:\n\n` +
+      `  login(authorization_url="<your Authorization URL from Genesys Admin>")\n\n` +
+      `Then retry your original request.`,
+    ) as T;
+  }
+}
+
+// ─── Auth ─────────────────────────────────────────────────────────────────────
+
+/**
+ * Guided onboarding / org-switching flow.
+ * - No args        → asks the user for their Authorization URL
+ * - authorization_url provided → parses it, updates config, starts browser login,
+ *                                returns step-by-step instructions
+ */
+export async function connect(args: Args) {
+  const rawAuthUrl = optStr(args, "authorization_url");
+
+  if (!rawAuthUrl) {
+    return ok(
+      `─── Connect to Genesys Cloud ───\n\n` +
+      `To get started, I need your OAuth client's Authorization URL.\n\n` +
+      `Where to find it:\n` +
+      `  1. Open Genesys Admin → Integrations → OAuth\n` +
+      `  2. Open the OAuth client you want to use\n` +
+      `  3. Copy the URL from the browser address bar — it looks like:\n` +
+      `       https://apps.{your-region}/directory/#/admin/access-management/authorized-apps/abc123-...\n\n` +
+      `Then call:\n` +
+      `  connect(authorization_url="<paste the URL here>")`,
+    );
+  }
+
+  // Parse the URL — same logic as login()
+  let parsed: URL;
+  try {
+    parsed = new URL(rawAuthUrl);
+  } catch {
+    return ok(
+      `Could not parse that URL: "${rawAuthUrl}"\n\n` +
+      `Expected format (paste from your browser address bar on the OAuth client page):\n` +
+      `  https://apps.{your-region}/directory/#/admin/access-management/authorized-apps/abc123-...`,
+    );
+  }
+
+  let extractedClientId: string | null = null;
+  let extractedRegion: string;
+
+  if (parsed.host.startsWith("login.")) {
+    // Format: https://login.{region}/oauth/authorize?client_id=...
+    extractedClientId = parsed.searchParams.get("client_id");
+    extractedRegion = parsed.host.replace(/^login\./, "");
+  } else if (parsed.host.startsWith("apps.")) {
+    // Two sub-formats from Genesys Admin:
+    //   Authorization URL field: .../authorized-apps/{client_id}
+    //   Browser address bar:     .../oauth-clients/{client_id}/view
+    const hash = parsed.hash; // everything after #
+    const authorizedAppsMatch = hash.match(/\/authorized-apps\/([a-f0-9-]{36})/i);
+    const oauthClientsMatch = hash.match(/\/oauth-clients\/([a-f0-9-]{36})/i);
+    extractedClientId = (authorizedAppsMatch ?? oauthClientsMatch)?.[1] ?? null;
+    extractedRegion = parsed.host.replace(/^apps\./, "");
+  } else {
+    return ok(
+      `Unrecognised URL format.\n\n` +
+      `Paste the Authorization URL from the field at the bottom of the OAuth client page in Genesys Admin.\n` +
+      `It looks like: https://apps.{your-region}/directory/#/admin/access-management/authorized-apps/{client_id}`,
+    );
+  }
+
+  if (!extractedClientId || extractedClientId.length < 10) {
+    return ok(
+      `Could not extract a client ID from: "${rawAuthUrl}"\n\n` +
+      `Copy the Authorization URL from the field labelled "Authorization URL" at the bottom of your\n` +
+      `OAuth client page in Genesys Admin → IT and Integrations → OAuth → your client.`,
+    );
+  }
+
+  const loginBase = `https://login.${extractedRegion}`;
+
+  // Build config directly from extracted values — do NOT call getGenesysConfig() because
+  // env vars (GENESYS_CLIENT_ID etc.) would shadow the freshly extracted values.
+  const existingFileBased = loadConfig().genesys ?? {};
+  const config: GenesysConfig = {
+    ...existingFileBased,
+    clientId: extractedClientId,
+    region: extractedRegion,
+    loginUrl: loginBase,
+    lastAuthorizationUrl: rawAuthUrl,
+  };
+  saveGenesysConfig(config);
+
+  // Start the browser flow
+  let authUrl: string;
+  try {
+    ({ authUrl } = preparePkceLogin(config));
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return ok(
+      `Credentials saved, but failed to start login flow: ${msg}\n\n` +
+      `  • Port 8787 in use? Kill it: lsof -ti:8787 | xargs kill -9, then call connect() again`,
+    );
+  }
+
+  return ok(
+    `─── Genesys Cloud — Connect ───\n\n` +
+    `Extracted from URL:\n` +
+    `  Client ID: ${extractedClientId.slice(0, 8)}...\n` +
+    `  Region:    ${extractedRegion}\n` +
+    `  Login URL: ${loginBase}\n\n` +
+    `─── Step 1: Log in via browser ───\n\n` +
+    `Your browser should open automatically.\n` +
+    `If it doesn't, open this URL manually:\n\n` +
+    `  ${authUrl}\n\n` +
+    `─── Step 2: Confirm ───\n\n` +
+    `Once you see the green "✓ Logged in to Genesys Cloud" page in your browser,\n` +
+    `come back here and call:\n\n` +
+    `  complete_login()\n`,
+  );
+}
+
+export async function configure_credentials(args: Args) {
+  const clientId = str(args, "client_id");
+  const clientSecret = optStr(args, "client_secret");
+  const region = str(args, "region");
+  const loginUrl = optStr(args, "login_url");
+  clearTokenCache();
+  clearUserToken();
+  saveGenesysConfig({ clientId, clientSecret, region, loginUrl });
+  const loginBase = loginUrl ?? `https://login.${region}`;
+  const authHint = clientSecret
+    ? "Client credentials auth ready. You can also call login to authenticate as a user."
+    : "No client_secret provided — call login to authenticate as a user via browser.";
+  return ok(
+    `Credentials saved.\n` +
+    `  Region:    ${region}\n` +
+    `  Client ID: ${clientId.slice(0, 8)}...\n` +
+    `  Login URL: ${loginBase}\n` +
+    `\n${authHint}\n` +
+    `\nCall login to start the OAuth2 browser flow, then smoke_test_auth to verify scopes.`,
+  );
+}
+
+export async function login(args: Args) {
+  const rawAuthUrl = optStr(args, "authorization_url");
+
+  // Prefer file-based config over env-var config to avoid stale/wrong-org env vars shadowing the
+  // saved client. If no authorization_url is provided and the file has a lastAuthorizationUrl,
+  // we re-use it so the user never has to paste it again after the first login.
+  const fileBasedGenesys = loadConfig().genesys;
+  const effectiveAuthUrl = rawAuthUrl ?? fileBasedGenesys?.lastAuthorizationUrl ?? null;
+  let config = effectiveAuthUrl ? null : getGenesysConfig();
+
+  // If an authorization_url was provided (or recovered from file), parse the client_id, region,
+  // and login base from it.
+  // Supports two URL formats that Genesys Admin may show:
+  //
+  //   Format A — OAuth authorize endpoint (login. domain, client_id in query string):
+  //     https://login.{your-region}/oauth/authorize?client_id=abc123-...
+  //
+  //   Format B — Admin app deep-link (apps. domain, client_id as last path segment):
+  //     https://apps.{your-region}/directory/#/admin/access-management/authorized-apps/abc123-...
+  if (effectiveAuthUrl) {
+    let parsed: URL;
+    try {
+      // The hash fragment (#/...) is not sent to the server but URL can still be parsed
+      parsed = new URL(effectiveAuthUrl);
+    } catch {
+      return ok(`Invalid authorization_url — could not parse as a URL: "${effectiveAuthUrl}"`);
+    }
+
+    let extractedClientId: string | null = null;
+    let extractedRegion: string;
+
+    if (parsed.host.startsWith("login.")) {
+      extractedClientId = parsed.searchParams.get("client_id");
+      extractedRegion = parsed.host.replace(/^login\./, "");
+    } else if (parsed.host.startsWith("apps.")) {
+      const hash = parsed.hash;
+      const authorizedAppsMatch = hash.match(/\/authorized-apps\/([a-f0-9-]{36})/i);
+      const oauthClientsMatch = hash.match(/\/oauth-clients\/([a-f0-9-]{36})/i);
+      extractedClientId = (authorizedAppsMatch ?? oauthClientsMatch)?.[1] ?? null;
+      extractedRegion = parsed.host.replace(/^apps\./, "");
+    } else {
+      return ok(
+        `Unrecognised URL format: host "${parsed.host}" is neither apps.* nor login.*\n\n` +
+        `Accepted forms (either is fine):\n` +
+        `  https://apps.{region}/directory/#/admin/access-management/authorized-apps/{clientId}\n` +
+        `  https://login.{region}/oauth/authorize?client_id={clientId}\n\n` +
+        `Copy the field labelled "Authorization URL" at the bottom of your OAuth client page in\n` +
+        `Genesys Admin → IT and Integrations → OAuth → your client.`,
+      );
+    }
+
+    if (!extractedClientId || extractedClientId.length < 10) {
+      return ok(
+        `Could not extract a client ID from: "${effectiveAuthUrl}"\n\n` +
+        `The URL looked like the right shape but no 36-character client ID was found in it.\n` +
+        `Expected a UUID after /authorized-apps/ or /oauth-clients/, or a client_id query parameter.\n\n` +
+        `Copy the Authorization URL from the field labelled "Authorization URL" at the bottom of\n` +
+        `your OAuth client page in Genesys Admin → IT and Integrations → OAuth → your client.`,
+      );
+    }
+
+    const loginBase = `https://login.${extractedRegion}`;
+
+    // Build the new config from extracted values, merging with any existing file-based config
+    // but always overriding clientId, region, and loginUrl from the Authorization URL.
+    // We do NOT call getGenesysConfig() here because env vars (GENESYS_CLIENT_ID etc.) would
+    // shadow the freshly extracted values — use the constructed object directly instead.
+    const existingFileBased = loadConfig().genesys ?? {};
+    const newConfig: GenesysConfig = {
+      ...existingFileBased,
+      clientId: extractedClientId,
+      region: extractedRegion,
+      loginUrl: loginBase,
+      lastAuthorizationUrl: effectiveAuthUrl,
+    };
+    saveGenesysConfig(newConfig);
+    config = newConfig;
+  }
+
+  if (!config) {
+    // Reached on a first run, before any Authorization URL has been stored.
+    // Deliberately instructs the agent to ASK before explaining: most users
+    // already have a client, and walking them through creating one they already
+    // have is both slow and confusing. Only the "no" branch needs the full setup.
+    return ok(
+      "No Genesys credentials stored yet — this is a first run.\n\n" +
+      "DO NOT guess or proceed. Ask the user this question first, and wait:\n\n" +
+      "  \"Do you already have a Genesys Cloud OAuth client set up for this?\"\n\n" +
+      "─── If they say YES ───\n" +
+      "Ask for the Authorization URL:\n" +
+      "  Genesys Admin → IT and Integrations → OAuth → open the client →\n" +
+      "  scroll to the bottom → copy the \"Authorization URL\" field.\n\n" +
+      "Pass whatever they paste straight to login(authorization_url=\"...\").\n" +
+      "DO NOT judge, correct, or reject the URL. Two different formats are valid\n" +
+      "and BOTH are accepted — the client ID and region are parsed from either:\n" +
+      "  • https://apps.{region}/directory/#/admin/access-management/authorized-apps/{id}\n" +
+      "  • https://login.{region}/oauth/authorize?client_id={id}\n" +
+      "The Genesys UI field usually contains the FIRST (apps./directory) form.\n" +
+      "That is correct and expected. If it does not parse, login() will say so —\n" +
+      "let the tool decide, do not pre-screen it.\n\n" +
+      "─── If they say NO ───\n" +
+      "Walk them through creating one, one step at a time, confirming as you go.\n" +
+      "Do not paste all of this at once.\n\n" +
+      "Step 1 — Create the client\n" +
+      "  Genesys Admin → Integrations → OAuth → Add Client\n" +
+      "    App Name:     Copilot Summary Optimizer MCP  (any name works)\n" +
+      "    Grant Types:  Code Authorization   ← must be this one\n" +
+      "    Redirect URI: http://localhost:8787/callback   ← must match exactly\n" +
+      "  No client secret is needed; this uses Authorization Code + PKCE.\n\n" +
+      "Step 2 — Add all 8 scopes under the Scope tab\n" +
+      "  ai-studio, analytics, assistants, conversations, notifications,\n" +
+      "  routing:readonly, speech-and-text-analytics:readonly, users:readonly\n" +
+      "  The three :readonly variants are what the Genesys scope picker offers —\n" +
+      "  this server only reads from those three APIs.\n" +
+      "  Add every one now. A missing scope fails later in non-obvious ways —\n" +
+      "  e.g. without `conversations`, voice transcripts work and only\n" +
+      "  messaging transcripts fail, with a 403 that looks unrelated.\n\n" +
+      "Step 3 — Save, then copy the Authorization URL\n" +
+      "  Reopen the client → scroll to the bottom → copy \"Authorization URL\".\n" +
+      "  It is usually the admin deep-link form, which is correct:\n" +
+      "    https://apps.{region}/directory/#/admin/access-management/authorized-apps/{id}\n" +
+      "  The /oauth/authorize?client_id=... form is also accepted.\n\n" +
+      "Then call: login(authorization_url=\"<pasted URL>\") with whatever they pasted.\n" +
+      "Do not reject or rewrite it — pass it through as-is.\n\n" +
+      "That URL is all that is needed — client ID and region are parsed from it.\n" +
+      "Do not set GENESYS_CLIENT_ID as an environment variable; it shadows the\n" +
+      "stored config and causes logins against the wrong org.",
+    );
+  }
+
+  const loginBase = config.loginUrl ?? `https://login.${config.region}`;
+
+  try {
+    const { authUrl } = preparePkceLogin(config);
+    return ok(
+      `─── Genesys Cloud Login ───\n\n` +
+      `Starting login for:\n` +
+      `  Client ID:  ${config.clientId.slice(0, 8)}...\n` +
+      `  Region:     ${config.region}\n` +
+      `  Login base: ${loginBase}\n\n` +
+      `Your browser should open automatically. If it doesn't, open this URL manually:\n\n` +
+      `  ${authUrl}\n\n` +
+      `─── Steps ───\n` +
+      `1. Log in with your Genesys Cloud credentials in the browser\n` +
+      `2. You will see a "Logged in to Genesys Cloud ✓" confirmation page\n` +
+      `3. Return here and call: complete_login()\n`,
+    );
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    return ok(
+      `Failed to start login: ${message}\n\n` +
+      `  Client ID: ${config.clientId.slice(0, 8)}...\n` +
+      `  Login base: ${loginBase}\n\n` +
+      `  • Port 8787 in use → kill it: lsof -ti:8787 | xargs kill -9, then retry`,
+    );
+  }
+}
+
+export async function complete_login(_args: Args) {
+  // Prefer the file-based config over env vars so the displayed Client ID reflects
+  // what was parsed from the Authorization URL, not an old env var value.
+  const fileConfig = loadConfig().genesys;
+  const config = fileConfig ?? getGenesysConfig();
+  if (!config) {
+    return ok("No credentials configured. Call connect(authorization_url=...) first.");
+  }
+
+  try {
+    const { token } = await completePkceLogin(config);
+
+    // Auto-run scope smoke test now that we have a user token
+    const smokeResult = await smoke_test_auth(_args);
+    const smokeText = smokeResult.content[0]?.text ?? "";
+
+    return ok(
+      `─── Login complete ───\n\n` +
+      `Logged in successfully. User token stored (expires in ~30 min).\n` +
+      `  Client ID: ${config.clientId.slice(0, 8)}...\n` +
+      `  Region:    ${config.region}\n` +
+      `  Token:     ${token.slice(0, 12)}...\n\n` +
+      `─── Scope verification ───\n\n` +
+      smokeText,
+    );
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    return ok(
+      `Login failed: ${message}\n\n` +
+      `─── Common causes ───\n` +
+      `  • "OAuth client ID or redirect URI is invalid"\n` +
+      `    → confirm http://localhost:8787/callback is listed under Redirect URIs on your OAuth client\n` +
+      `    → confirm the client_id in the URL matches the OAuth client\n` +
+      `  • No login in progress → call connect(authorization_url=...) to start again\n` +
+      `  • Timed out (3 min limit) → call connect(authorization_url=...) to restart`,
+    );
+  }
+}
+
+export async function logout(_args: Args) {
+  clearUserToken();
+  return ok("User token cleared. The server will use client credentials on the next request.");
+}
+
+// ─── Auth smoke test ──────────────────────────────────────────────────────────
+
+interface ScopeCheckResult {
+  scope: string;
+  description: string;
+  status: "ok" | "missing_scope" | "no_user_token" | "error";
+  detail: string;
+  requiresUserToken: boolean;
+}
+
+async function runScopeCheck(
+  name: string,
+  scope: string,
+  requiresUserToken: boolean,
+  hasUserToken: boolean,
+  testFn: () => Promise<void>,
+): Promise<ScopeCheckResult> {
+  const base: Omit<ScopeCheckResult, "status" | "detail"> = {
+    scope,
+    description: name,
+    requiresUserToken,
+  };
+
+  if (requiresUserToken && !hasUserToken) {
+    return {
+      ...base,
+      status: "no_user_token",
+      detail: "Requires user login — run the login tool and retry.",
+    };
+  }
+
+  try {
+    await testFn();
+    return { ...base, status: "ok", detail: "API call succeeded." };
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    // Distinguish scope/auth failures from other errors
+    const isScopeFail =
+      msg.includes("403") ||
+      msg.toLowerCase().includes("forbidden") ||
+      msg.toLowerCase().includes("insufficient") ||
+      msg.toLowerCase().includes("scope");
+    const isAuthFail =
+      msg.includes("401") || msg.toLowerCase().includes("unauthorized");
+
+    if (isScopeFail) {
+      return {
+        ...base,
+        status: "missing_scope",
+        detail: `Scope '${scope}' appears to be missing from the OAuth client. Add it in Genesys Admin → Integrations → OAuth. Error: ${msg}`,
+      };
+    }
+    if (isAuthFail) {
+      return {
+        ...base,
+        status: "missing_scope",
+        detail: `Authentication failed — token may be expired. Run login and retry. Error: ${msg}`,
+      };
+    }
+    // Any other error (404 for missing resource, 400 for bad query) still means scope is present
+    return { ...base, status: "ok", detail: `API responded (non-auth error, scope present): ${msg}` };
+  }
+}
+
+export async function smoke_test_auth(_args: Args) {
+  const config = getGenesysConfig();
+  if (!config) {
+    return ok(
+      "No Genesys credentials configured.\n" +
+      "Call login(authorization_url=\"...\") first, then complete_login(), then retry.\n" +
+      "Do not call configure_credentials — login() parses everything it needs from the\n" +
+      "Authorization URL on your OAuth client page.",
+    );
+  }
+
+  const userToken = await getUserToken(config);
+  const hasUserToken = !!userToken;
+  const authMode = hasUserToken ? "user token (Authorization Code + PKCE)" : "client credentials only";
+
+  // Import genesys client inline — used for scope tests
+  const { genesys } = await import("../genesys/client.js");
+
+  const checks: ScopeCheckResult[] = await Promise.all([
+    // 1. users scope — resolve current user (user token only)
+    runScopeCheck(
+      "Identity: resolve current user",
+      "users:readonly",
+      true,
+      hasUserToken,
+      async () => {
+        const base = `https://api.${config.region}`;
+        const resp = await fetch(`${base}/api/v2/users/me`, {
+          headers: {
+            Authorization: `Bearer ${userToken}`,
+            Accept: "application/json",
+          },
+        });
+        if (!resp.ok) throw new Error(`${resp.status} ${resp.statusText}`);
+      },
+    ),
+
+    // 2. ai-studio scope — list summary settings (Conversations Summaries API requires ai-studio)
+    runScopeCheck(
+      "AI Studio: list summary settings",
+      "ai-studio",
+      false,
+      hasUserToken,
+      async () => {
+        await genesys.get("/api/v2/conversations/summaries/settings");
+      },
+    ),
+
+    // 3. analytics scope — run a minimal conversation query
+    runScopeCheck(
+      "Analytics: query conversations",
+      "analytics",
+      false,
+      hasUserToken,
+      async () => {
+        await genesys.post("/api/v2/analytics/conversations/details/query", {
+          interval: "2020-01-01T00:00:00Z/2020-01-01T00:01:00Z",
+          paging: { pageSize: 1, pageNumber: 1 },
+        });
+      },
+    ),
+
+    // 4. speechandtextanalytics scope — list STA programs
+    runScopeCheck(
+      "Speech & Text Analytics: read STA programs",
+      "speech-and-text-analytics:readonly",
+      false,
+      hasUserToken,
+      async () => {
+        await genesys.get("/api/v2/speechandtextanalytics/programs?pageSize=1");
+      },
+    ),
+
+    // 5. assistants scope — list assistants
+    runScopeCheck(
+      "Assistants: list Agent Copilot assistants",
+      "assistants",
+      false,
+      hasUserToken,
+      async () => {
+        // Checks only that the assistants scope is granted, so pageSize=1 with no
+        // tier filter is enough.
+        await genesys.get(`/api/v2/assistants?pageSize=1`);
+      },
+    ),
+
+    // 6. notifications scope — create a notification channel (user token only; required for preview summaries)
+    runScopeCheck(
+      "Notifications: create a notification channel",
+      "notifications",
+      true,
+      hasUserToken,
+      async () => {
+        const base = `https://api.${config.region}`;
+        const resp = await fetch(`${base}/api/v2/notifications/channels`, {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${userToken}`,
+            "Content-Type": "application/json",
+            Accept: "application/json",
+          },
+          body: "{}",
+        });
+        if (!resp.ok) throw new Error(`${resp.status} ${resp.statusText}`);
+      },
+    ),
+
+    // 7. routing scope — list queues (required for build_interaction_filter)
+    runScopeCheck(
+      "Routing: list queues",
+      "routing:readonly",
+      false,
+      hasUserToken,
+      async () => {
+        await genesys.get("/api/v2/routing/queues?pageSize=1");
+      },
+    ),
+
+    // 8. conversations scope — read a messaging conversation.
+    //    Required by the messaging transcript fallback in fetch_transcripts_bulk
+    //    (GET /conversations/messages/{id} + POST .../messages/bulk), which runs
+    //    whenever STA transcript retrieval fails on a messaging interaction.
+    //    NOTE: this scope is NOT what authorises the summary settings endpoints —
+    //    those authorise under ai-studio despite living beneath /conversations/.
+    //    A well-formed but non-existent conversation ID gives us clean
+    //    discrimination: 403 when the scope is absent, 404 when it is present
+    //    (runScopeCheck treats non-auth errors as proof the scope exists).
+    runScopeCheck(
+      "Conversations: read messaging conversation",
+      "conversations",
+      false,
+      hasUserToken,
+      async () => {
+        await genesys.get(
+          "/api/v2/conversations/messages/00000000-0000-0000-0000-000000000000",
+        );
+      },
+    ),
+  ]);
+
+  const passed = checks.filter((c) => c.status === "ok").length;
+  const missingScope = checks.filter((c) => c.status === "missing_scope");
+  const needsLogin = checks.filter((c) => c.status === "no_user_token");
+  const total = checks.length;
+
+  const statusIcon = (s: ScopeCheckResult["status"]) => {
+    switch (s) {
+      case "ok": return "✓";
+      case "missing_scope": return "✗";
+      case "no_user_token": return "⚠";
+      case "error": return "?";
+    }
+  };
+
+  const lines = [
+    `Auth mode: ${authMode}`,
+    `Result: ${passed}/${total} checks passed`,
+    "",
+    ...checks.map((c) =>
+      `${statusIcon(c.status)} [${c.scope}] ${c.description}\n  → ${c.detail}`,
+    ),
+  ];
+
+  if (missingScope.length > 0) {
+    lines.push(
+      "",
+      "─── Action required ───",
+      "The following scopes are missing from your OAuth client.",
+      "Fix: Genesys Admin → Integrations → OAuth → your client → Scope tab → add each missing scope.",
+      "",
+      ...missingScope.map((c) => `  • ${c.scope}`),
+    );
+  }
+
+  if (needsLogin.length > 0) {
+    lines.push(
+      "",
+      "─── User login required ───",
+      "Some checks require a user token and were skipped. Run the login tool, then retry smoke_test_auth.",
+    );
+  }
+
+  if (missingScope.length === 0 && needsLogin.length === 0) {
+    lines.push("", "All checks passed — credentials and scopes are correctly configured.");
+  }
+
+  return ok(lines.join("\n"));
+}
+
+// ─── Conversations ────────────────────────────────────────────────────────────
+
+export async function search_conversations(args: Args) {
+  return withTokenRefresh(async () => {
+    const results = await searchConversations({
+      dateFrom: str(args, "date_from"),
+      dateTo: str(args, "date_to"),
+      queueIds: Array.isArray(args.queue_ids) ? args.queue_ids.map(String) : undefined,
+      wrapUpCodes: Array.isArray(args.wrap_up_codes) ? args.wrap_up_codes.map(String) : undefined,
+      maxResults: typeof args.max_results === "number" ? args.max_results : 25,
+    });
+    return json({
+      total: results.length,
+      conversations: results,
+      tip: "Use fetch_transcript with summary_config_name, conversation_id, and transcript_type to cache a transcript for testing.",
+    });
+  });
+}
+
+// ─── Transcripts (lifecycle-scoped) ──────────────────────────────────────────
+
+export async function fetch_transcript(args: Args) {
+  return withTokenRefresh(async () => {
+    const configName = str(args, "summary_config_name");
+    const conversationId = str(args, "conversation_id");
+    const transcriptType = (optStr(args, "transcript_type") ?? "static") as "static" | "dynamic";
+
+    const communicationId =
+      optStr(args, "communication_id") ??
+      (await resolveCustomerCommunicationId(conversationId));
+
+    const label = optStr(args, "label") ?? `${conversationId.slice(0, 8)}/${communicationId.slice(0, 8)}`;
+
+    const { plainText, rawJson } = await fetchAndTransformTranscript(conversationId, communicationId);
+
+    const transcript: StoredTranscript = {
+      id: uuidv4(),
+      label,
+      conversationId,
+      communicationId,
+      plainText,
+      rawJson,
+      createdAt: new Date().toISOString(),
+      transcriptType,
+    };
+    storage.saveLifecycleTranscript(configName, transcript);
+
+    return json({
+      id: transcript.id,
+      label,
+      transcriptType,
+      summaryConfigName: configName,
+      conversationId,
+      communicationId,
+      lineCount: plainText.split("\n").length,
+      preview: plainText.slice(0, 300) + (plainText.length > 300 ? "..." : ""),
+    });
+  });
+}
+
+// ─── Summary extraction helpers ──────────────────────────────────────────────
+
+interface SummaryEntity {
+  summaryType?: string;
+  summary?: string;
+  generated?: boolean;
+  [key: string]: unknown;
+}
+
+interface ExistingSummaryResult {
+  /** The best/final summary — agent-edited if one exists, otherwise AI-generated Agent type */
+  existingSummary: string;
+  /**
+   * The original AI-generated summary, populated only when an agent-edited version also exists.
+   * Together with existingSummary, these form the before/after pair.
+   */
+  aiGeneratedSummary?: string;
+}
+
+/**
+ * Fetch existing production summaries for a conversation.
+ *
+ * Returns the best summary plus the before/after pair when an agent edited it:
+ * - "Agent" summaryType, generated=false → agent-edited (the "after")
+ * - "Agent" summaryType, generated=true  → AI-generated (the "before")
+ * - If only AI-generated exists: returns it as existingSummary with no aiGeneratedSummary
+ * - Fallback to "Conversation" type if no "Agent" entries exist
+ */
+async function fetchBestExistingSummary(conversationId: string): Promise<ExistingSummaryResult | undefined> {
+  try {
+    const resp = await getExistingSummaries(conversationId) as { entities?: SummaryEntity[] };
+    const entities = resp?.entities ?? [];
+    if (entities.length === 0) return undefined;
+
+    const agentEntities = entities.filter((e) => e.summaryType === "Agent" && e.summary);
+
+    if (agentEntities.length > 0) {
+      const edited = agentEntities.find((e) => e.generated === false);
+      const aiGenerated = agentEntities.find((e) => e.generated === true);
+
+      if (edited?.summary && aiGenerated?.summary) {
+        // Agent edited the AI-generated summary — we have both before and after
+        return {
+          existingSummary: edited.summary,
+          aiGeneratedSummary: aiGenerated.summary,
+        };
+      }
+
+      // Only one Agent entry (AI-generated or edited without a pair)
+      const best = edited ?? aiGenerated;
+      if (best?.summary) return { existingSummary: best.summary };
+    }
+
+    // Fallback to Conversation type, then first available
+    const preferred = ["Conversation"];
+    for (const type of preferred) {
+      const match = entities.find((e) => e.summaryType === type && e.summary);
+      if (match?.summary) return { existingSummary: match.summary };
+    }
+    const first = entities[0]?.summary;
+    return first ? { existingSummary: first } : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+export async function fetch_transcripts_bulk(args: Args) {
+  return withTokenRefresh(async () => {
+    const configName = str(args, "summary_config_name");
+    const dateFrom = str(args, "date_from");
+    const dateTo = str(args, "date_to");
+    const maxConversations = Math.min(typeof args.max_conversations === "number" ? args.max_conversations : 50, 200);
+    const concurrency = Math.min(typeof args.concurrency === "number" ? args.concurrency : 5, 10);
+
+    // Load interaction filter to get queue IDs
+    const filter = storage.loadInteractionFilter(configName);
+    if (!filter) {
+      return ok(
+        `No interaction-filter.json found for "${configName}".\n\n` +
+        `Run build_interaction_filter first to set up the working directory.`,
+      );
+    }
+
+    // Search for conversations scoped to the copilot's queues.
+    // Only voice, message, and callback are relevant for summary testing.
+    const conversations = await searchConversations({
+      dateFrom,
+      dateTo,
+      queueIds: filter.queueIds,
+      maxResults: maxConversations,
+      includeMediaTypes: ["voice", "message", "callback"],
+    });
+
+    if (conversations.length === 0) {
+      return ok(
+        `No conversations found for "${configName}" between ${dateFrom} and ${dateTo}.\n\n` +
+        `The queues may have had no activity in this period.`,
+      );
+    }
+
+    // Process in parallel batches using a concurrency pool
+    const results = {
+      saved: 0,
+      skipped: 0,
+      noTranscript: 0,
+      errors: 0,
+      errorDetails: [] as string[],
+    };
+
+    // Pool: process `concurrency` conversations at a time
+    const queue = [...conversations];
+    const inFlight: Promise<void>[] = [];
+
+    async function processOne(conv: {
+      conversationId: string;
+      startTime?: string;
+      communications?: Array<{ type?: string }>;
+    }) {
+      try {
+        // Check if already saved (skip duplicates)
+        const existing = storage.getLifecycleTranscript(configName, conv.conversationId);
+        if (existing) {
+          results.skipped++;
+          return;
+        }
+
+        // Client-side guard: only process conversations with at least one allowed media type
+        const ALLOWED_TYPES = new Set(["voice", "message", "callback"]);
+        const types = (conv.communications ?? []).map((c) => c.type ?? "");
+        const hasAllowed = types.some((t) => ALLOWED_TYPES.has(t));
+        if (!hasAllowed) {
+          results.skipped++;
+          return;
+        }
+
+        // Transcript fetch strategy:
+        //   1. Always try STA/S3 first — works for both voice and messaging when
+        //      Genesys transcription is enabled on the queue.
+        //   2. If STA fails and the conversation is messaging, fall back to the
+        //      Conversations Messages bulk API (for orgs without STA on messaging).
+        //   3. If both fail, mark as noTranscript.
+        let plainText: string | undefined;
+        let rawJson: unknown;
+        let communicationId: string | undefined;
+
+        // Attempt 1: STA transcript
+        try {
+          communicationId = await resolveCustomerCommunicationId(conv.conversationId);
+          const fetched = await fetchAndTransformTranscript(conv.conversationId, communicationId);
+          plainText = fetched.plainText;
+          rawJson = fetched.rawJson;
+        } catch {
+          // STA failed — try messages API for messaging conversations
+        }
+
+        if (!plainText) {
+          const isMessaging = (conv.communications ?? []).some((c) => c.type === "message");
+          if (isMessaging) {
+            try {
+              plainText = await fetchMessagingTranscript(conv.conversationId);
+              communicationId = undefined;
+              rawJson = undefined;
+            } catch {
+              // Messages API also failed
+            }
+          }
+        }
+
+        if (!plainText) {
+          results.noTranscript++;
+          return;
+        }
+
+        // Fetch existing production summary (best-effort).
+        // Returns before/after pair when agent edited the AI-generated summary.
+        const summaryResult = await fetchBestExistingSummary(conv.conversationId);
+
+        const transcript: StoredTranscript = {
+          id: conv.conversationId,
+          label: `${conv.startTime ? new Date(conv.startTime).toLocaleDateString("en-AU") : "?"} / ${conv.conversationId.slice(0, 8)}`,
+          conversationId: conv.conversationId,
+          ...(communicationId ? { communicationId } : {}),
+          plainText,
+          // rawJson intentionally omitted — plainText is the only downstream-usable form
+          ...(summaryResult ? {
+            existingSummary: summaryResult.existingSummary,
+            ...(summaryResult.aiGeneratedSummary ? { aiGeneratedSummary: summaryResult.aiGeneratedSummary } : {}),
+          } : {}),
+          createdAt: new Date().toISOString(),
+          transcriptType: "static",
+        };
+        storage.saveLifecycleTranscript(configName, transcript);
+        results.saved++;
+      } catch (err) {
+        results.errors++;
+        results.errorDetails.push(`${conv.conversationId}: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+
+    // Run with concurrency limit
+    let idx = 0;
+    while (idx < queue.length || inFlight.length > 0) {
+      while (inFlight.length < concurrency && idx < queue.length) {
+        const conv = queue[idx++];
+        const p = processOne(conv).then(() => {
+          inFlight.splice(inFlight.indexOf(p), 1);
+        });
+        inFlight.push(p);
+      }
+      if (inFlight.length > 0) await Promise.race(inFlight);
+    }
+
+    const lines = [
+      `─── Bulk Fetch Complete ───`,
+      ``,
+      `Working dir:       ${configName}`,
+      `Date range:        ${dateFrom} → ${dateTo}`,
+      `Conversations:     ${conversations.length} found`,
+      ``,
+      `✓ Saved:           ${results.saved} transcripts + summaries`,
+      `↷ Skipped:         ${results.skipped} (already saved)`,
+      `✗ No transcript:   ${results.noTranscript} (not transcribed)`,
+      ...(results.errors > 0 ? [`⚠ Errors:          ${results.errors}`] : []),
+    ];
+
+    if (results.errorDetails.length > 0) {
+      lines.push(``, `Errors:`, ...results.errorDetails.slice(0, 5).map((e) => `  • ${e}`));
+    }
+
+    lines.push(
+      ``,
+      `Saved to: summaryconfig-lifecycle/${configName}/transcripts/static/`,
+      ``,
+      `Next: use list_transcripts(summary_config_name="${configName}") to review, ` +
+      `or generate_test_case to build a test case from one of the transcripts.`,
+    );
+
+    return ok(lines.join("\n"));
+  });
+}
+
+export async function fetch_existing_summaries_bulk(args: Args) {
+  return withTokenRefresh(async () => {
+    const configName = str(args, "summary_config_name");
+    const concurrency = Math.min(typeof args.concurrency === "number" ? args.concurrency : 5, 10);
+    const overwrite = args.overwrite === true;
+
+    const transcripts = storage.listLifecycleTranscripts(configName);
+
+    if (transcripts.length === 0) {
+      return ok(`No transcripts found in "${configName}". Run fetch_transcripts_bulk first.`);
+    }
+
+    const toProcess = overwrite
+      ? transcripts
+      : transcripts.filter((t) => !t.existingSummary);
+
+    if (toProcess.length === 0) {
+      return ok(
+        `All ${transcripts.length} transcripts in "${configName}" already have summaries.\n` +
+        `Pass overwrite=true to re-fetch.`,
+      );
+    }
+
+    const results = { enriched: 0, noSummary: 0, errors: 0, skipped: transcripts.length - toProcess.length };
+
+    const queue = [...toProcess];
+    const inFlight: Promise<void>[] = [];
+
+    async function processOne(t: StoredTranscript) {
+      if (!t.conversationId) {
+        results.noSummary++;
+        return;
+      }
+      try {
+        const summaryResult = await fetchBestExistingSummary(t.conversationId);
+        if (!summaryResult) {
+          results.noSummary++;
+          return;
+        }
+        const updated: StoredTranscript = {
+          ...t,
+          rawJson: undefined, // strip rawJson — plainText is all that's needed downstream
+          existingSummary: summaryResult.existingSummary,
+          ...(summaryResult.aiGeneratedSummary ? { aiGeneratedSummary: summaryResult.aiGeneratedSummary } : {}),
+        };
+        if (t.transcriptType === "dynamic") {
+          storage.updateDynamicTranscript(configName, updated);
+        } else {
+          storage.saveLifecycleTranscript(configName, updated);
+        }
+        results.enriched++;
+      } catch {
+        results.errors++;
+      }
+    }
+
+    let idx = 0;
+    while (idx < queue.length || inFlight.length > 0) {
+      while (inFlight.length < concurrency && idx < queue.length) {
+        const t = queue[idx++];
+        const p = processOne(t).then(() => { inFlight.splice(inFlight.indexOf(p), 1); });
+        inFlight.push(p);
+      }
+      if (inFlight.length > 0) await Promise.race(inFlight);
+    }
+
+    return ok(
+      `─── Summary Enrichment Complete ───\n\n` +
+      `Working dir:  ${configName}\n` +
+      `Total:        ${transcripts.length} transcripts\n\n` +
+      `✓ Enriched:   ${results.enriched} (summaries added)\n` +
+      `↷ Skipped:    ${results.skipped} (already had summary)\n` +
+      `✗ No summary: ${results.noSummary} (conversation has no production summary)\n` +
+      (results.errors > 0 ? `⚠ Errors:      ${results.errors}\n` : ``) +
+      `\nSummaries saved to each transcript's existingSummary field.`,
+    );
+  });
+}
+
+export async function store_transcript(args: Args) {
+  const configName = str(args, "summary_config_name");
+  const raw = str(args, "transcript");
+  const transcriptType = (optStr(args, "transcript_type") ?? "static") as "static" | "dynamic";
+  const plainText = normaliseManualTranscript(raw);
+  const transcript: StoredTranscript = {
+    id: uuidv4(),
+    label: optStr(args, "label") ?? "Manual transcript",
+    conversationId: optStr(args, "conversation_id"),
+    plainText,
+    createdAt: new Date().toISOString(),
+    transcriptType,
+  };
+  storage.saveLifecycleTranscript(configName, transcript);
+  return json({
+    id: transcript.id,
+    label: transcript.label,
+    transcriptType,
+    summaryConfigName: configName,
+    lineCount: plainText.split("\n").length,
+  });
+}
+
+export async function list_transcripts(args: Args) {
+  const configName = str(args, "summary_config_name");
+  const transcriptType = optStr(args, "transcript_type") as "static" | "dynamic" | undefined;
+  const transcripts = storage.listLifecycleTranscripts(configName, transcriptType);
+  return json(
+    transcripts.map((t) => ({
+      id: t.id,
+      label: t.label,
+      transcriptType: t.transcriptType,
+      conversationId: t.conversationId,
+      lineCount: t.plainText.split("\n").length,
+      generatedSummaryCount: t.generatedSummaries?.length ?? 0,
+      hasEditedSummary: !!t.editedSummary,
+      createdAt: t.createdAt,
+    })),
+  );
+}
+
+// ─── Summary config ───────────────────────────────────────────────────────────
+
+export async function list_summary_settings(_args: Args) {
+  return withTokenRefresh(async () => {
+    const settings = await listSummarySettings();
+    // settingType is listed because it decides whether the pipeline can work with a
+    // config at all — anything other than "Prompt" is driven by fields it never reads.
+    return json(settings.map((s) => ({
+      id: s.id,
+      name: s.name,
+      language: s.language,
+      settingType: s.settingType,
+      prompt: s.prompt?.slice(0, 100),
+    })));
+  });
+}
+
+export async function get_summary_setting(args: Args) {
+  return withTokenRefresh(async () => {
+    const setting = await getSummarySetting(str(args, "summary_setting_id"));
+    // Merged into the setting rather than wrapping it, so the response keeps the same
+    // shape whether or not the warning fires.
+    const warning = unsupportedSettingTypeWarning(setting);
+    return json(warning ? { ...setting, warning } : setting);
+  });
+}
+
+export async function create_summary_setting(args: Args) {
+  return withTokenRefresh(async () => {
+    const setting: Omit<SummarySetting, "id"> = {
+      name: str(args, "name"),
+      prompt: str(args, "prompt"),
+      language: optStr(args, "language") ?? "en-au",
+      summaryType: (optStr(args, "summary_type") as SummarySetting["summaryType"]) ?? "Concise",
+      format: (optStr(args, "format") as SummarySetting["format"]) ?? "TextBlock",
+      maskPII: { all: args.mask_pii === true },
+      predefinedInsights: Array.isArray(args.predefined_insights)
+        ? (args.predefined_insights as SummarySetting["predefinedInsights"])
+        : [],
+      settingType: "Prompt",
+      serviceType: "Native",
+      timeoutDuration: typeof args.timeout_duration === "number" ? args.timeout_duration : 20,
+    };
+    const created = await createSummarySetting(setting);
+    return json({ success: true, id: created.id, name: created.name });
+  });
+}
+
+export async function update_summary_setting(args: Args) {
+  return withTokenRefresh(async () => {
+    // The rest of the pipeline is keyed on summary_config_name, so accept that too
+    // and resolve the ID from the interaction filter built for that config.
+    let id: string;
+    if (args.summary_setting_id) {
+      id = str(args, "summary_setting_id");
+    } else if (args.summary_config_name) {
+      const configName = str(args, "summary_config_name");
+      const filter = storage.loadInteractionFilter(configName);
+      if (!filter?.summarySettingId) {
+        throw new Error(
+          `Cannot resolve a summary setting for config "${configName}" — no interaction filter found. ` +
+          `Run build_interaction_filter first, or pass summary_setting_id explicitly.`,
+        );
+      }
+      id = filter.summarySettingId;
+    } else {
+      throw new Error("Either summary_setting_id or summary_config_name is required");
+    }
+
+    // Genesys treats this endpoint as a full replace, not a patch: a body containing only
+    // the prompt is rejected ("Language must not be blank") and would otherwise silently
+    // drop participant labels, insights and PII masking. Read the live setting and send it
+    // back whole, changing only what was asked for. Unrecognised fields are carried through
+    // untouched so a field added by Genesys later is not wiped by an older client.
+    const current = (await getSummarySetting(id)) as unknown as Record<string, unknown>;
+
+    // `id` is dropped as well: the Genesys Admin UI sends the body without it, and this
+    // request is deliberately shaped to match the one the UI is known to accept.
+    const READ_ONLY_FIELDS = ["id", "selfUri", "dateCreated", "dateModified", "createdBy", "modifiedBy"];
+    const body: Record<string, unknown> = { ...current };
+    for (const field of READ_ONLY_FIELDS) delete body[field];
+
+    const newPrompt = str(args, "prompt");
+    const previousPrompt = typeof current.prompt === "string" ? current.prompt : "";
+    body.prompt = newPrompt;
+    if (args.name) body.name = str(args, "name");
+
+    if (!body.language) {
+      throw new Error(
+        `Summary setting ${id} came back from Genesys without a language, so it cannot be ` +
+        `updated without wiping a required field. Check the setting in Genesys Admin.`,
+      );
+    }
+
+    const updated = await updateSummarySetting(id, body as unknown as Partial<SummarySetting>);
+
+    const preservedFields = Object.keys(body)
+      .filter((k) => k !== "prompt")
+      .sort();
+
+    return json({
+      success: true,
+      id: updated.id,
+      name: updated.name,
+      prompt_changed: newPrompt !== previousPrompt,
+      previous_prompt_length: previousPrompt.length,
+      new_prompt_length: newPrompt.length,
+      preserved_fields: preservedFields,
+      note:
+        "The full setting was sent back to Genesys with only the prompt" +
+        (args.name ? " and name" : "") +
+        " changed; every other field was preserved as read from the live setting.",
+      next_step_mandatory: [
+        "1. save_version(status=\"deployed\") — record what is now live, with notes saying which " +
+        "candidate it came from and why it was chosen.",
+        "2. generate_rollup_report(summary_config_name, test_set_name, executive_summary, themes, " +
+        "next_steps) — the closing report for the cycle. The user has accepted a version, so the " +
+        "effort now needs an account of it: where the config started, what was wrong, what was " +
+        "changed, what it bought, and what is still open. Do not hand-write this HTML.",
+      ],
+    });
+  });
+}
+
+// ─── Summary generation ───────────────────────────────────────────────────────
+
+/**
+ * Filler for the fields the preview body must carry but the model never reads.
+ *
+ * With settingType "Prompt" only `prompt` and `language` shape the output, so these
+ * values are not a fidelity compromise — they exist because the API requires a
+ * complete body. See buildSettingBody in genesys/summaries.ts.
+ */
+const FALLBACK_PREVIEW_STRUCTURE = {
+  summaryType: "Concise" as const,
+  format: "TextBlock" as const,
+  maskPII: { all: false },
+  predefinedInsights: [] as SummarySetting["predefinedInsights"],
+  settingType: "Prompt" as const,
+  serviceType: "Native",
+};
+
+/**
+ * Read the live summary setting for a config, resolved through its interaction filter.
+ *
+ * Worth reading for TWO fields: `language`, which selects the output language and so
+ * does change the summaries, and `settingType`, which says whether this config is one
+ * the pipeline can reason about at all. The rest of the live object is carried into the
+ * preview body unread — see FALLBACK_PREVIEW_STRUCTURE.
+ *
+ * Returns null rather than throwing. A preview that defaults to en-au is still worth
+ * generating, and callers report which base they used so a wrong language is visible
+ * rather than silent.
+ */
+async function loadLiveSettingForPreview(configName: string): Promise<SummarySetting | null> {
+  const filter = storage.loadInteractionFilter(configName);
+  if (!filter?.summarySettingId) return null;
+  try {
+    return await getSummarySetting(filter.summarySettingId);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The one thing the pipeline assumes about a config it is pointed at.
+ *
+ * Every stage downstream — deriving requirements, authoring test cases, scoring a run,
+ * recommending improvements — reads the prompt and nothing else. That is correct for
+ * settingType "Prompt" and wrong for any other type, where behaviour comes from fields
+ * this pipeline never looks at. Such a config would still run: previews would generate,
+ * scores would be recorded, and the whole report would describe a prompt that is not
+ * what production is using.
+ *
+ * Warned rather than refused, so an unfamiliar setting type does not become a dead end
+ * the user cannot inspect. Callers surface this in their response.
+ */
+function unsupportedSettingTypeWarning(setting: SummarySetting | null): string | null {
+  if (!setting || setting.settingType === "Prompt") return null;
+  return (
+    `This summary configuration has settingType "${setting.settingType}", not "Prompt". ` +
+    `The pipeline evaluates the prompt field alone, so for this config it is reasoning ` +
+    `about the wrong input: requirements, test cases and scores will not reflect what ` +
+    `production actually generates. Results are not trustworthy — confirm the setting ` +
+    `type before acting on them.`
+  );
+}
+
+/**
+ * Describe the base a preview or snapshot was built on.
+ *
+ * Reports the two fields that matter (`language` and `settingType`) and nothing else.
+ * It previously listed format, insight count and whether participant labels were set,
+ * which invited exactly the wrong conclusion: that a formatting failure might be an
+ * artefact of preview structure rather than a real defect in the prompt. With
+ * settingType "Prompt" those fields do not reach the model, so a formatting failure is
+ * always about the prompt.
+ */
+function describePreviewBase(base: SummarySetting | null): string {
+  if (!base) {
+    return (
+      "fallback defaults — the live setting could not be read, so language defaults to " +
+      "en-au. Confirm that matches production; every other field is inert for " +
+      'settingType "Prompt".'
+    );
+  }
+  return (
+    `inherited from the live Genesys setting (language: ${base.language}, ` +
+    `settingType: ${base.settingType})`
+  );
+}
+
+/**
+ * Compose the setting used to generate preview summaries: production structure, candidate
+ * prompt. `timeoutDuration` is intentionally longer than production because previews are
+ * generated in bulk over a WebSocket rather than inline on a live conversation.
+ */
+function buildPreviewSetting(opts: {
+  base: SummarySetting | null;
+  name: string;
+  prompt: string;
+  language?: string;
+  timeoutDuration: number;
+}): SummarySetting {
+  const { base, name, prompt, language, timeoutDuration } = opts;
+  return {
+    ...FALLBACK_PREVIEW_STRUCTURE,
+    ...(base ?? {}),
+    name,
+    prompt,
+    language: language ?? base?.language ?? "en-au",
+    settingType: "Prompt",
+    timeoutDuration,
+  };
+}
+
+export async function generate_preview_summary(args: Args) {
+  const configName = optStr(args, "summary_config_name");
+
+  // Resolve transcript
+  let transcript: string;
+  if (args.transcript_id) {
+    const tId = str(args, "transcript_id");
+    let stored: StoredTranscript | null = null;
+    if (configName) {
+      stored = storage.getLifecycleTranscript(configName, tId);
+    }
+    if (!stored) throw new Error(`Transcript not found: ${tId}. Provide summary_config_name if the transcript is stored in the lifecycle structure.`);
+    transcript = stored.plainText;
+  } else if (args.transcript_text) {
+    transcript = str(args, "transcript_text");
+  } else {
+    throw new Error("Either transcript_id or transcript_text is required");
+  }
+
+  // Resolve summarySetting
+  let setting: SummarySetting;
+  if (args.summary_setting_id) {
+    setting = await getSummarySetting(str(args, "summary_setting_id"));
+    if (args.prompt) setting.prompt = str(args, "prompt");
+  } else {
+    if (!args.prompt) throw new Error("Either summary_setting_id or prompt is required");
+    setting = {
+      name: "preview-test",
+      prompt: str(args, "prompt"),
+      language: optStr(args, "language") ?? "en-au",
+      summaryType: (optStr(args, "summary_type") as SummarySetting["summaryType"]) ?? "Concise",
+      format: (optStr(args, "format") as SummarySetting["format"]) ?? "TextBlock",
+      maskPII: { all: false },
+      predefinedInsights: Array.isArray(args.predefined_insights)
+        ? (args.predefined_insights as SummarySetting["predefinedInsights"])
+        : [],
+      settingType: "Prompt",
+      serviceType: "Native",
+      timeoutDuration: 20,
+    };
+  }
+
+  return withTokenRefresh(async () => {
+    const response = await generatePreviewSummary(transcript, setting);
+
+    if (response === null) {
+      return ok(
+        "Preview request sent (204 accepted), but no user token is available to receive the result.\n\n" +
+        "The preview API delivers results via a user-scoped WebSocket notification. " +
+        "Call the login tool to authenticate as a Genesys Cloud user, then retry.",
+      );
+    }
+
+    const summaryText = extractSummaryText(response);
+
+    // If a dynamic transcript ID was provided, record the generated summary on it
+    if (args.transcript_id && configName) {
+      const tId = str(args, "transcript_id");
+      const stored = storage.getLifecycleTranscript(configName, tId);
+      if (stored && stored.transcriptType === "dynamic") {
+        stored.generatedSummaries = stored.generatedSummaries ?? [];
+        stored.generatedSummaries.push({
+          prompt: setting.prompt,
+          summary: summaryText,
+          generatedAt: new Date().toISOString(),
+        });
+        storage.updateDynamicTranscript(configName, stored);
+      }
+    }
+
+    return json({
+      summary: summaryText,
+      raw_response: response,
+      transcript_lines: transcript.split("\n").length,
+    });
+  });
+}
+
+export async function get_existing_summaries(args: Args) {
+  return withTokenRefresh(async () => {
+    const result = await getExistingSummaries(str(args, "conversation_id"));
+    return json(result);
+  });
+}
+
+// ─── Test cases (lifecycle-scoped rubrics) ────────────────────────────────────
+
+export async function generate_test_case(args: Args) {
+  const configName = str(args, "summary_config_name");
+  const transcriptIds = strArr(args, "sample_transcript_ids");
+  const sampleSummaries = strArr(args, "sample_summaries");
+  const testCaseName = str(args, "test_case_name");
+  const focusAreas = Array.isArray(args.focus_areas) ? args.focus_areas.map(String) : [];
+
+  if (transcriptIds.length !== sampleSummaries.length) {
+    throw new Error("sample_transcript_ids and sample_summaries must have the same length");
+  }
+
+  const samples = transcriptIds.map((id, i) => {
+    const t = storage.getLifecycleTranscript(configName, id);
+    return {
+      transcriptId: id,
+      transcript: t?.plainText ?? "(transcript not found)",
+      idealSummary: sampleSummaries[i],
+    };
+  });
+
+  return json({
+    instruction: [
+      "Using the sample transcripts and ideal summaries below, author a test case JSON and call save_test_case to persist it.",
+      "",
+      "STEP 1 — IDENTIFY DIMENSIONS (3–6)",
+      "Each dimension tests one discrete, observable concern in the summary output.",
+      "Derive dimensions from what the ideal summaries demonstrate — not from generic principles.",
+      "Each dimension must reference the BR- requirement IDs it validates (from requirements/final/requirements.md).",
+      "",
+      "STEP 2 — DETERMINE applicability_condition FOR EVERY DIMENSION (MANDATORY)",
+      "For each dimension, ask: 'Is this check meaningful for every transcript, or only when a specific condition is present?'",
+      "",
+      "Set applicability_condition to:",
+      "  - \"always\"  →  the dimension applies unconditionally to every transcript",
+      "  - A plain-English condition string  →  the dimension only applies when the condition is true",
+      "",
+      "Common condition patterns to consider:",
+      "  - 'Summary contains bullets.'  (for bullet-character or bullet-format rules)",
+      "  - 'Summary contains at least 2 sections.'  (for section-separator rules)",
+      "  - 'Only applies when a third party participated in the interaction.'",
+      "  - 'Only applies when a complaint or dissatisfaction was raised.'",
+      "  - 'Only applies when order status was explicitly discussed.'",
+      "  - 'Only applies when the customer's intent was unclear in the transcript.'",
+      "",
+      "STEP 3 — PAUSE AND ASK WHEN UNCERTAIN",
+      "If you are unsure whether a dimension is 'always' or conditional:",
+      "  DO NOT default to 'always' and proceed.",
+      "  Instead, stop, describe the uncertain dimension(s), and ask the user to clarify the condition before calling save_test_case.",
+      "  Example: 'I'm not sure whether \"Fallback text used\" should be always or only applies when intent is unclear — which do you prefer?'",
+      "",
+      "STEP 4 — WRITE CRITERIA",
+      "pass_criteria: describe the scoring gradient from 1.0 (perfect) downward with explicit decimal anchor points.",
+      "  Format: 'Score 1.0: [perfect]. Score [X] if [partial condition]. Score 0 if [total failure].'",
+      "fail_criteria: describe the complete failure condition (score 0 only).",
+      "pass_threshold: 1.0 for binary must/must-not rules; 0.8 for coverage and style rules.",
+      "",
+      "STEP 5 — CALL save_test_case",
+      "Only call save_test_case once all dimensions have confirmed applicability_conditions.",
+      "Never call save_test_case with any dimension still set to 'always' if you are not certain that is correct.",
+    ].join("\n"),
+    test_case_name: testCaseName,
+    summary_config_name: configName,
+    focus_areas: focusAreas,
+    samples,
+    applicability_condition_examples: {
+      note: "These are real examples showing how applicability_condition is used in practice. Use them as reference when authoring new dimensions.",
+      always: [
+        { dimension: "Customer terminology", condition: "always", rationale: "Every summary references the external participant — the terminology rule applies universally." },
+        { dimension: "Nothing inferred", condition: "always", rationale: "Inference is prohibited in all summaries, regardless of transcript content." },
+        { dimension: "Numbered lists absent", condition: "always", rationale: "Numbered lists are prohibited everywhere — applies regardless of summary content." },
+      ],
+      conditional: [
+        { dimension: "Section spacing correct", condition: "Summary contains at least 2 sections.", rationale: "A single-section summary has no adjacent sections to separate — the rule is structurally inapplicable." },
+        { dimension: "Bullet character correct", condition: "Summary contains bullets.", rationale: "A summary with no bullets cannot violate the bullet character rule." },
+        { dimension: "Third-party role stated", condition: "Only applies when a third party participated in the interaction.", rationale: "If no third party was present, there is nothing to identify — scoring would be meaningless." },
+        { dimension: "Each intent captured separately", condition: "Only applies when the customer expressed more than one distinct intent.", rationale: "A single-intent call cannot be tested for multi-intent capture." },
+        { dimension: "Fallback when status absent", condition: "Only applies when the order status was NOT discussed in the transcript.", rationale: "If the stage was discussed, the dimension being tested (fallback text) is not applicable." },
+      ],
+    },
+  });
+}
+
+export async function save_test_case(args: Args) {
+  const configName = str(args, "summary_config_name");
+  const name = str(args, "name");
+  const rawDimensions = Array.isArray(args.dimensions) ? args.dimensions : [];
+
+  const testCase: TestCase = {
+    name,
+    description: optStr(args, "description") ?? "",
+    dimensions: rawDimensions.map((d: unknown) => {
+      const dim = d as Record<string, unknown>;
+      return {
+        name: String(dim.name ?? ""),
+        description: String(dim.description ?? ""),
+        weight: Number(dim.weight ?? 3),
+        applicabilityCondition: String(dim.applicability_condition ?? "always"),
+        passCriteria: String(dim.pass_criteria ?? ""),
+        failCriteria: String(dim.fail_criteria ?? ""),
+        passThreshold: dim.pass_threshold != null ? Number(dim.pass_threshold) : 0.8,
+        requirementIds: Array.isArray(dim.requirement_ids) ? dim.requirement_ids.map(String) : undefined,
+      };
+    }),
+    createdAt: new Date().toISOString(),
+  };
+
+  // WHY THESE ARE CHECKED HERE AND NOT LEFT TO THE SCHEMA
+  // ----------------------------------------------------
+  // A JSON Schema `required` array only forces a key to be present, not to say anything.
+  // passCriteria and failCriteria were already required and still arrived as "" on every
+  // dimension of every test case in a real workspace, which left the scorer judging them
+  // with nothing but a name and a description. requirementIds was merely optional, and was
+  // omitted wholesale — so requirement coverage reported every requirement as untested
+  // while the test cases plainly exercised most of them.
+  //
+  // Refusing the save is the only feedback that actually lands: an empty field costs
+  // nothing to write and its absence is invisible until a dashboard contradicts itself
+  // several steps later.
+  const problems: string[] = [];
+  for (const [i, dim] of testCase.dimensions.entries()) {
+    const where = `dimensions[${i}] "${dim.name || "(unnamed)"}"`;
+    if (!dim.passCriteria.trim()) problems.push(`${where}: pass_criteria is empty.`);
+    if (!dim.failCriteria.trim()) problems.push(`${where}: fail_criteria is empty.`);
+    if (!dim.requirementIds || dim.requirementIds.length === 0) {
+      problems.push(`${where}: requirement_ids is empty.`);
+    }
+  }
+  if (problems.length > 0) {
+    throw new Error(
+      `Test case "${name}" was not saved — ${problems.length} problem(s):\n\n` +
+      problems.map((p) => `  • ${p}`).join("\n") +
+      `\n\npass_criteria and fail_criteria are what the scorer judges against; a dimension ` +
+      `carrying only a name and description is scored on the evaluator's guess. ` +
+      `requirement_ids is what makes the dimension traceable — without it the run report ` +
+      `counts the requirement as untested.\n\n` +
+      `If a dimension genuinely validates nothing in requirements/final/requirements.md, the ` +
+      `requirement is missing from that file: add it there first rather than leaving the link blank.`,
+    );
+  }
+
+  // Unknown ids are rejected rather than stored. A typo'd or invented id silently produces
+  // a requirement that looks untested plus a dimension that traces nowhere — build.ts
+  // already surfaces these as unknownRequirementIds after the fact, which is too late to
+  // be useful.
+  const parsed = loadRequirements(configName);
+  if (!parsed.unavailable) {
+    const known = new Set(parsed.requirements.map((r) => r.id));
+    const unknown = [
+      ...new Set(
+        testCase.dimensions.flatMap((d) => (d.requirementIds ?? []).filter((id) => !known.has(id))),
+      ),
+    ];
+    if (unknown.length > 0) {
+      throw new Error(
+        `Test case "${name}" was not saved — ${unknown.length} requirement id(s) do not exist in ` +
+        `requirements/final/requirements.md:\n\n` +
+        unknown.map((id) => `  • ${id}`).join("\n") +
+        `\n\nThere are ${parsed.requirements.length} requirements on file, ${parsed.filePath ?? ""}. ` +
+        `Read it for the real ids, or add the missing requirement to it first.`,
+      );
+    }
+  }
+
+  storage.saveTestCase(configName, testCase);
+
+  // Coverage is returned so authoring can be closed as a loop here, rather than the gap
+  // surfacing as an "untested requirements" chip on a dashboard after a run has been scored.
+  const linked = [...new Set(testCase.dimensions.flatMap((d) => d.requirementIds ?? []))];
+  const coveredAcrossAll = new Set(
+    storage.listTestCases(configName).flatMap((tc) => tc.dimensions.flatMap((d) => d.requirementIds ?? [])),
+  );
+  const stillUncovered = parsed.unavailable
+    ? []
+    : parsed.requirements.filter((r) => !coveredAcrossAll.has(r.id)).map((r) => r.id);
+
+  return json({
+    name: testCase.name,
+    summaryConfigName: configName,
+    dimensions: testCase.dimensions.length,
+    requirements_linked_by_this_test_case: linked,
+    requirements_still_uncovered: stillUncovered,
+    coverage_note: parsed.unavailable
+      ? "requirements.md could not be read, so coverage was not checked."
+      : stillUncovered.length === 0
+        ? `All ${parsed.requirements.length} requirements are now covered by at least one dimension.`
+        : `${coveredAcrossAll.size} of ${parsed.requirements.length} requirements covered. ` +
+          `The ids above have no dimension validating them yet.`,
+  });
+}
+
+export async function list_test_cases(args: Args) {
+  const configName = str(args, "summary_config_name");
+  return json(
+    storage.listTestCases(configName).map((tc) => ({
+      name: tc.name,
+      description: tc.description,
+      dimensions: tc.dimensions.map((d) => d.name),
+      createdAt: tc.createdAt,
+    })),
+  );
+}
+
+// ─── Test sets ────────────────────────────────────────────────────────────────
+
+export async function save_test_set(args: Args) {
+  const configName = str(args, "summary_config_name");
+  const name = str(args, "name");
+
+  const testSet: TestSet = {
+    name,
+    description: optStr(args, "description"),
+    testCaseNames: strArr(args, "test_case_names"),
+    transcriptIds: strArr(args, "transcript_ids"),
+    createdAt: new Date().toISOString(),
+  };
+
+  storage.saveTestSet(configName, testSet);
+  return json({
+    name: testSet.name,
+    summaryConfigName: configName,
+    testCases: testSet.testCaseNames.length,
+    transcripts: testSet.transcriptIds.length,
+  });
+}
+
+export async function list_test_sets(args: Args) {
+  const configName = str(args, "summary_config_name");
+  return json(
+    storage.listTestSets(configName).map((ts) => ({
+      name: ts.name,
+      description: ts.description,
+      testCaseNames: ts.testCaseNames,
+      transcriptCount: ts.transcriptIds.length,
+      createdAt: ts.createdAt,
+    })),
+  );
+}
+
+// ─── Evaluate summary ─────────────────────────────────────────────────────────
+
+export async function evaluate_summary(args: Args) {
+  const configName = str(args, "summary_config_name");
+  const testCaseName = str(args, "test_case_name");
+  const testCase = storage.getTestCase(configName, testCaseName);
+  if (!testCase) throw new Error(`Test case not found: ${testCaseName} (in config: ${configName})`);
+
+  return json({
+    instruction:
+      "Evaluate the summary below against each test case dimension. For each dimension, determine whether it PASSED or FAILED based on the criteria, provide a score (0.0–1.0), and give brief reasoning. Then call save_eval_run with the results.",
+    test_case: {
+      name: testCase.name,
+      description: testCase.description,
+      dimensions: testCase.dimensions.map((d) => ({
+        name: d.name,
+        description: d.description,
+        weight: d.weight,
+        pass_criteria: d.passCriteria,
+        fail_criteria: d.failCriteria,
+      })),
+    },
+    transcript: str(args, "transcript_text"),
+    summary: str(args, "summary_text"),
+    score_template: testCase.dimensions.map((d) => ({
+      dimension: d.name,
+      passed: null,
+      score: null,
+      reasoning: "",
+    })),
+  });
+}
+
+// ─── Eval runs ────────────────────────────────────────────────────────────────
+
+const pendingEvalRuns = new Map<
+  string,
+  {
+    configName: string;
+    testSetName: string;
+    prompt: string;
+    setting: SummarySetting;
+    generated: Array<{
+      transcriptId: string;
+      transcriptLabel: string;
+      transcript: string;
+      summary: string;
+    }>;
+    testCaseNames: string[];
+    transcriptIds: string[];
+  }
+>();
+
+export async function run_test_suite(args: Args) {
+  const configName = str(args, "summary_config_name");
+  const testSetName = str(args, "test_set_name");
+  const prompt = str(args, "prompt");
+
+  // Load test set
+  const testSet = storage.getTestSet(configName, testSetName);
+  if (!testSet) throw new Error(`Test set not found: ${testSetName} (in config: ${configName})`);
+
+  // Build summarySetting
+  let setting: SummarySetting;
+  if (args.summary_setting_id) {
+    setting = await getSummarySetting(str(args, "summary_setting_id"));
+    setting.prompt = prompt;
+  } else {
+    // Production structure, candidate prompt — see buildPreviewSetting.
+    setting = buildPreviewSetting({
+      base: await loadLiveSettingForPreview(configName),
+      name: testSetName,
+      prompt,
+      language: optStr(args, "language"),
+      timeoutDuration: 20,
+    });
+  }
+
+  // Load test cases from the test set
+  const testCases = testSet.testCaseNames.map((name) => {
+    const tc = storage.getTestCase(configName, name);
+    if (!tc) throw new Error(`Test case not found: ${name} (in config: ${configName})`);
+    return tc;
+  });
+
+  // Generate previews for all transcripts in the test set
+  const generated: Array<{
+    transcriptId: string;
+    transcriptLabel: string;
+    transcript: string;
+    summary: string;
+  }> = [];
+
+  for (const tId of testSet.transcriptIds) {
+    const stored = storage.getLifecycleTranscript(configName, tId);
+    if (!stored) throw new Error(`Transcript not found: ${tId} (in config: ${configName})`);
+    const response = await generatePreviewSummary(stored.plainText, setting);
+    if (response === null) {
+      throw new Error(
+        "No user token available for preview generation. Call the login tool to authenticate as a Genesys Cloud user first.",
+      );
+    }
+    const summaryText = extractSummaryText(response);
+    generated.push({
+      transcriptId: tId,
+      transcriptLabel: stored.label,
+      transcript: stored.plainText,
+      summary: summaryText,
+    });
+  }
+
+  const runKey = uuidv4();
+  pendingEvalRuns.set(runKey, {
+    configName,
+    testSetName,
+    prompt,
+    setting,
+    generated,
+    testCaseNames: testSet.testCaseNames,
+    transcriptIds: testSet.transcriptIds,
+  });
+
+  return json({
+    run_key: runKey,
+    summary_config_name: configName,
+    test_set_name: testSetName,
+    prompt_used: prompt,
+    instruction:
+      "Below are the generated summaries for each transcript. Evaluate each against every test case dimension, then call save_eval_run with your scores to persist the results.",
+    test_cases: testCases.map((tc) => ({
+      name: tc.name,
+      description: tc.description,
+      dimensions: tc.dimensions.map((d) => ({
+        name: d.name,
+        weight: d.weight,
+        pass_criteria: d.passCriteria,
+        fail_criteria: d.failCriteria,
+      })),
+    })),
+    generated_summaries: generated,
+  });
+}
+
+export async function save_eval_run(args: Args) {
+  const runKey = str(args, "run_key");
+  const rawResults = Array.isArray(args.results) ? args.results : [];
+  const suggestedImprovements = optStr(args, "suggested_improvements");
+
+  const pending = pendingEvalRuns.get(runKey);
+  if (!pending) {
+    throw new Error(
+      `No pending eval run found with run_key ${runKey}. Make sure to call run_test_suite first.`,
+    );
+  }
+
+  const { configName, testSetName, prompt, setting, generated, testCaseNames, transcriptIds } = pending;
+
+  // Build EvalRunResult for each (transcript × test case) result provided
+  const evalResults: EvalRunResult[] = rawResults.map((r: unknown) => {
+    const row = r as Record<string, unknown>;
+    const tId = String(row.transcript_id ?? "");
+    const testCaseName = String(row.test_case_name ?? "");
+    const stored = storage.getLifecycleTranscript(configName, tId);
+    const generatedEntry = generated.find((g) => g.transcriptId === tId);
+
+    const rawScores = Array.isArray(row.dimension_scores) ? row.dimension_scores : [];
+    const dimensionScores = rawScores.map((s: unknown) => {
+      const sc = s as Record<string, unknown>;
+      const dimName = String(sc.dimension ?? "");
+      if (sc.score === null) {
+        return { dimension: dimName, score: null as null, na: true, passed: true, reasoning: String(sc.reasoning ?? "") };
+      }
+      return {
+        dimension: dimName,
+        passed: Boolean(sc.passed),
+        score: Number(sc.score ?? 0),
+        na: false,
+        reasoning: String(sc.reasoning ?? ""),
+      };
+    });
+    const scoredDims = dimensionScores.filter((d) => !d.na);
+    const overallScore =
+      scoredDims.length > 0
+        ? scoredDims.reduce((sum, d) => sum + (d.score as number), 0) / scoredDims.length
+        : 0;
+    const overallPassed = scoredDims.length === 0 || scoredDims.every((d) => d.passed);
+
+    return {
+      testCaseName,
+      transcriptId: tId,
+      transcriptLabel: stored?.label ?? tId,
+      summary: generatedEntry?.summary ?? "",
+      dimensionScores,
+      overallPassed,
+      overallScore,
+    };
+  });
+
+  const aggregatePassRate =
+    evalResults.length > 0
+      ? evalResults.filter((r) => r.overallPassed).length / evalResults.length
+      : 0;
+
+  const runNumber = storage.getNextRunNumber(configName, testSetName);
+
+  const meta: EvalRunMeta = {
+    runNumber,
+    testSetName,
+    summaryConfigName: configName,
+    prompt,
+    summarySetting: setting,
+    transcriptIds,
+    testCaseNames,
+    aggregatePassRate,
+    suggestedImprovements,
+    createdAt: new Date().toISOString(),
+  };
+
+  storage.saveEvalRun(configName, testSetName, runNumber, meta, evalResults);
+  pendingEvalRuns.delete(runKey);
+
+  return json({
+    success: true,
+    summary_config_name: configName,
+    test_set_name: testSetName,
+    run_number: runNumber,
+    aggregate_pass_rate: `${(aggregatePassRate * 100).toFixed(1)}%`,
+    transcripts_evaluated: evalResults.length,
+    suggested_improvements: suggestedImprovements,
+  });
+}
+
+export async function list_eval_runs(args: Args) {
+  const configName = str(args, "summary_config_name");
+  const testSetName = optStr(args, "test_set_name");
+  const runs = storage.listEvalRuns(configName, testSetName);
+  return json(
+    runs.map((r) => ({
+      runNumber: r.runNumber,
+      testSetName: r.testSetName,
+      prompt: r.prompt.slice(0, 100) + (r.prompt.length > 100 ? "..." : ""),
+      testCases: r.testCaseNames,
+      transcriptCount: r.transcriptIds.length,
+      passRate: `${(r.aggregatePassRate * 100).toFixed(1)}%`,
+      createdAt: r.createdAt,
+    })),
+  );
+}
+
+// ─── Version history ──────────────────────────────────────────────────────────
+
+export async function save_version(args: Args) {
+  const configName = str(args, "summary_config_name");
+  const notes = optStr(args, "notes");
+
+  const rawStatus = optStr(args, "status");
+  if (rawStatus && rawStatus !== "candidate" && rawStatus !== "deployed") {
+    throw new Error(`Invalid status: "${rawStatus}". Must be "candidate" or "deployed".`);
+  }
+  // Reading a setting back from Genesys captures what is live; an inline prompt is
+  // a local draft. Either default can be overridden explicitly.
+  const status: "candidate" | "deployed" =
+    (rawStatus as "candidate" | "deployed" | undefined) ??
+    (args.summary_setting_id ? "deployed" : "candidate");
+
+  let setting: SummarySetting;
+  let structureSource: string;
+  let settingTypeWarning: string | null = null;
+  if (args.summary_setting_id) {
+    setting = await getSummarySetting(str(args, "summary_setting_id"));
+    structureSource = "read from the live Genesys setting";
+    settingTypeWarning = unsupportedSettingTypeWarning(setting);
+  } else if (args.prompt) {
+    // A snapshot must carry the whole live object so a later deploy replaces the config
+    // with the customer's own metadata rather than fabricated defaults — the update
+    // endpoint is a full replace. Only the prompt is local.
+    const liveSetting = await loadLiveSettingForPreview(configName);
+    structureSource = liveSetting
+      ? "inherited from the live Genesys setting (only the prompt is local)"
+      : "fallback defaults — the live setting could not be read, so the non-prompt fields " +
+        "are placeholders. Harmless for generation, but check the snapshot before deploying " +
+        "it, since a deploy replaces the live config wholesale.";
+    settingTypeWarning = unsupportedSettingTypeWarning(liveSetting);
+    setting = {
+      ...FALLBACK_PREVIEW_STRUCTURE,
+      ...(liveSetting ?? {}),
+      name: liveSetting?.name ?? configName,
+      prompt: str(args, "prompt"),
+      language: optStr(args, "language") ?? liveSetting?.language ?? "en-au",
+      settingType: "Prompt",
+      timeoutDuration: liveSetting?.timeoutDuration ?? 20,
+    };
+  } else {
+    throw new Error("Either summary_setting_id or prompt is required");
+  }
+
+  const snapshot = storage.saveVersionSnapshot(configName, setting, notes, status);
+  return json({
+    success: true,
+    version: snapshot.version,
+    status: snapshot.status,
+    summaryConfigName: configName,
+    snapshotAt: snapshot.snapshotAt,
+    notes: snapshot.notes,
+    structure_source: structureSource,
+    ...(settingTypeWarning ? { warning: settingTypeWarning } : {}),
+  });
+}
+
+export async function list_versions(args: Args) {
+  const configName = str(args, "summary_config_name");
+  return json(
+    storage.listVersionSnapshots(configName).map((v) => ({
+      version: v.version,
+      // Snapshots predating the status field are treated as deployed.
+      status: v.status ?? "deployed",
+      snapshotAt: v.snapshotAt,
+      notes: v.notes,
+      promptPreview: v.setting.prompt.slice(0, 100) + (v.setting.prompt.length > 100 ? "..." : ""),
+    })),
+  );
+}
+
+// ─── Copilot config ───────────────────────────────────────────────────────────
+
+export async function list_assistants(_args: Args) {
+  return withTokenRefresh(async () => {
+    const assistants = await listAssistants();
+    return json(assistants);
+  });
+}
+
+export async function get_copilot_config(args: Args) {
+  return withTokenRefresh(async () => {
+    const config = await getCopilotConfig(str(args, "assistant_id"));
+    return json(config);
+  });
+}
+
+export async function update_copilot_config(args: Args) {
+  return withTokenRefresh(async () => {
+    const assistantId = str(args, "assistant_id");
+    const config = args.config;
+    if (!config || typeof config !== "object") throw new Error("config must be an object");
+    const updated = await updateCopilotConfig(assistantId, config);
+    return json({ success: true, result: updated });
+  });
+}
+
+export async function build_interaction_filter(args: Args) {
+  return withTokenRefresh(async () => {
+    const copilotId = optStr(args, "copilot_id");
+    const copilotName = optStr(args, "copilot_name");
+    const chosenSummarySettingId = optStr(args, "summary_setting_id");
+
+    if (!copilotId && !copilotName) {
+      return ok(
+        "What is the name of your Agent Copilot in Genesys?\n\n" +
+        "Provide it as copilot_name (e.g. \"Acme_Copilot\") or copilot_id.\n" +
+        "Not sure? Call list_assistants to see all Agent Copilots in your org.",
+      );
+    }
+
+    // Resolve the copilot by name if ID not provided
+    let resolvedId = copilotId ?? "";
+    let resolvedName = copilotName ?? "";
+
+    const all = await listAssistants();
+
+    if (!copilotId && copilotName) {
+      const match = all.find(
+        (a) => a.name.toLowerCase() === copilotName.toLowerCase(),
+      );
+      if (!match) {
+        const names = all.map((a) => `  • ${a.name}`).join("\n");
+        return ok(
+          `No Agent Copilot found with name "${copilotName}".\n\n` +
+          `Available Agent Copilots:\n${names}`,
+        );
+      }
+      resolvedId = match.id;
+      resolvedName = match.name;
+    } else if (copilotId && !copilotName) {
+      resolvedName = all.find((a) => a.id === copilotId)?.name ?? copilotId;
+    }
+
+    // Step 1: Get copilot config and extract summary settings
+    const copilot = await getCopilotConfig(resolvedId);
+    const sgc = copilot.summaryGenerationConfig;
+
+    if (!sgc?.enabled) {
+      return ok(
+        `"${resolvedName}" does not have summary generation enabled.\n\n` +
+        `Enable it in Genesys Admin → Agent Copilot → ${resolvedName} → Summary, ` +
+        `then re-run build_interaction_filter.`,
+      );
+    }
+
+    // Collect all summary settings — single or multi-language
+    const allSettings: Array<{ id: string; language?: string }> = [];
+    if (sgc.summarySettings && Array.isArray(sgc.summarySettings)) {
+      for (const s of sgc.summarySettings) {
+        if (s.id) allSettings.push({ id: s.id, language: s.language });
+      }
+    }
+    if (sgc.summarySetting?.id) {
+      if (!allSettings.some((s) => s.id === sgc.summarySetting!.id)) {
+        allSettings.push({ id: sgc.summarySetting.id });
+      }
+    }
+
+    if (allSettings.length === 0) {
+      return ok(
+        `"${resolvedName}" has summary generation enabled but no summary setting is linked.\n\n` +
+        `Link a summary configuration in Genesys Admin → Agent Copilot → ${resolvedName} → Summary, ` +
+        `then re-run build_interaction_filter.`,
+      );
+    }
+
+    // Step 2: If multiple summary settings and none chosen, ask the user to pick
+    let chosenSetting: { id: string; language?: string };
+
+    if (allSettings.length > 1 && !chosenSummarySettingId) {
+      const options = allSettings
+        .map((s, i) => `  ${i + 1}. ${s.id}${s.language ? ` (${s.language})` : ""}`)
+        .join("\n");
+      return ok(
+        `"${resolvedName}" has ${allSettings.length} summary configurations (likely multi-language).\n\n` +
+        `Which summary setting would you like to work with?\n\n${options}\n\n` +
+        `Re-call build_interaction_filter with summary_setting_id set to your chosen ID.`,
+      );
+    }
+
+    if (chosenSummarySettingId) {
+      const found = allSettings.find((s) => s.id === chosenSummarySettingId);
+      if (!found) {
+        return ok(
+          `summary_setting_id "${chosenSummarySettingId}" is not linked to "${resolvedName}".\n\n` +
+          `Linked settings:\n${allSettings.map((s) => `  • ${s.id}${s.language ? ` (${s.language})` : ""}`).join("\n")}`,
+        );
+      }
+      chosenSetting = found;
+    } else {
+      chosenSetting = allSettings[0];
+    }
+
+    // Step 3: Resolve the summary setting name to use as the working directory name
+    const settingDetail = await getSummarySetting(chosenSetting.id);
+    const configName = (settingDetail.name ?? chosenSetting.id).replace(/[^a-zA-Z0-9_\-]/g, "_");
+
+    // Step 4: Find the queues directly associated with this copilot
+    const queues = await getAssistantQueues(resolvedId);
+    const queueIds = queues.map((q) => q.id);
+
+    // Step 5: Save interaction filter and create the full workspace in one shot
+    const filter: storage.InteractionFilter = {
+      summaryConfigName: configName,
+      summarySettingId: chosenSetting.id,
+      ...(chosenSetting.language ? { summaryLanguage: chosenSetting.language } : {}),
+      builtAt: new Date().toISOString(),
+      copilots: [
+        {
+          assistantId: resolvedId,
+          assistantName: resolvedName,
+          queues: queues.map((q) => ({ id: q.id, name: q.name })),
+        },
+      ],
+      queueIds,
+    };
+
+    storage.saveInteractionFilter(configName, filter);
+    storage.ensureAllLifecycleDirs(configName);
+
+    // Step 6: Snapshot the current summary config as v0 (baseline — only written once)
+    const v0 = storage.saveInitialVersionSnapshot(configName, settingDetail);
+    const v0Line = v0
+      ? `  ├── version-history/\n  │   └── summary-configuration-0.json  ← initial snapshot\n`
+      : `  ├── version-history/  (v0 already exists)\n`;
+
+    const queueText = queues.length
+      ? queues.map((q) => `  • ${q.name} (${q.id})`).join("\n")
+      : "  (none found — the copilot may not be deployed to any queues yet)";
+
+    const langLine = chosenSetting.language ? `\nLanguage:        ${chosenSetting.language}` : "";
+
+    return ok(
+      `─── Workspace Created ───\n\n` +
+      `Agent Copilot:   ${resolvedName}\n` +
+      `Summary config:  ${settingDetail.name ?? chosenSetting.id}${langLine}\n` +
+      `Summary setting: ${chosenSetting.id}\n` +
+      `Working dir:     ${configName}\n\n` +
+      `Queues (${queues.length}):\n${queueText}\n\n` +
+      `Directory structure:\n` +
+      `  summaryconfig-lifecycle/${configName}/\n` +
+      `  ├── interaction-filter.json\n` +
+      `  ├── requirements/\n` +
+      `  │   ├── artefacts/   ← drop raw inputs here (emails, docs, screenshots)\n` +
+      `  │   └── final/       ← distilled requirements go here (e.g. requirements.md)\n` +
+      v0Line +
+      `  ├── transcripts/\n` +
+      `  │   ├── static/\n` +
+      `  │   └── dynamic/\n` +
+      `  ├── test-cases/\n` +
+      `  ├── test-sets/\n` +
+      `  └── eval-runs/\n\n` +
+      (queueIds.length
+        ? `Next: call fetch_transcripts_bulk(summary_config_name="${configName}", date_from=..., date_to=...) to fetch transcripts.`
+        : `No queues found. Once the copilot is deployed on queues, re-run build_interaction_filter to update the filter.`),
+    );
+  });
+}
+
+// ─── Batched preview cache builder ───────────────────────────────────────────
+
+export async function prepare_prompt_test(args: Args) {
+  return withTokenRefresh(async () => {
+    const configName = str(args, "summary_config_name");
+    const testSetName = str(args, "test_set_name");
+    const versionNumber = Number(args.version_number);
+    const batchSize = Math.min(Number(args.batch_size ?? 5), 15);
+    const clearCache = args.clear_cache === true;
+
+    const snapshots = storage.listVersionSnapshots(configName);
+    const snapshot = snapshots.find((s) => s.version === versionNumber);
+    if (!snapshot) {
+      const available = snapshots.map((s) => s.version).join(", ") || "none";
+      throw new Error(`Version ${versionNumber} not found for "${configName}". Available: ${available}`);
+    }
+
+    const testSet = storage.getTestSet(configName, testSetName);
+    if (!testSet) throw new Error(`Test set not found: ${testSetName}`);
+
+    if (clearCache) storage.clearPreviewCache(configName, testSetName, versionNumber);
+
+    const cache = storage.loadPreviewCache(configName, testSetName, versionNumber);
+    const allIds = testSet.transcriptIds.filter((id) => storage.getLifecycleTranscript(configName, id) != null);
+    const pending = allIds.filter((id) => !(id in cache));
+
+    if (pending.length === 0) {
+      return ok(
+        `✓ Preview cache complete — ${allIds.length}/${allIds.length} summaries ready.\n` +
+        `Call start_eval_run(summary_config_name="${configName}", test_set_name="${testSetName}", mode="prompt_test", version_number=${versionNumber}) to start the eval run.`,
+      );
+    }
+
+    // Production structure, candidate prompt — see buildPreviewSetting.
+    const liveSetting = await loadLiveSettingForPreview(configName);
+    const setting = buildPreviewSetting({
+      base: liveSetting ?? snapshot.setting,
+      name: testSetName,
+      prompt: snapshot.setting.prompt,
+      language: optStr(args, "language"),
+      timeoutDuration: 50,
+    });
+
+    const toProcess = pending.slice(0, batchSize);
+    let generated = 0;
+    let authFailed = false;
+
+    // Fire all previews in this batch in parallel
+    await Promise.all(
+      toProcess.map(async (tId) => {
+        const stored = storage.getLifecycleTranscript(configName, tId)!;
+        const response = await generatePreviewSummary(stored.plainText, setting);
+        if (response === null) {
+          authFailed = true;
+          return;
+        }
+        cache[tId] = extractSummaryText(response);
+        generated++;
+      }),
+    );
+    // Persist after the whole batch completes
+    storage.savePreviewCache(configName, testSetName, versionNumber, cache);
+
+    if (authFailed) {
+      return ok("No user token available for preview generation. Call login first, then retry.");
+    }
+
+    const done = Object.keys(cache).length;
+    const total = allIds.length;
+    const remaining = total - done;
+    const complete = remaining === 0;
+
+    const lines = [
+      `─── Preview Cache Progress ───`,
+      ``,
+      `Config:      ${configName}`,
+      `Test set:    ${testSetName}`,
+      `Version:     ${versionNumber} (${snapshot.status ?? "candidate"})`,
+      ``,
+      `Generated:   ${generated} this call`,
+      `Cached:      ${done}/${total}`,
+      `Remaining:   ${remaining}`,
+      `Complete:    ${complete ? "YES ✓" : `NO — call prepare_prompt_test again (${Math.ceil(remaining / batchSize)} more call(s))`}`,
+    ];
+
+    if (complete) {
+      lines.push(
+        ``,
+        `All summaries ready. Next step:`,
+        `  start_eval_run(summary_config_name="${configName}", test_set_name="${testSetName}", mode="prompt_test", version_number=${versionNumber})`,
+      );
+    }
+
+    return ok(lines.join("\n"));
+  });
+}
+
+// ─── Stateless parallel eval run ─────────────────────────────────────────────
+
+export async function start_eval_run(args: Args) {
+  return withTokenRefresh(async () => {
+    const configName = str(args, "summary_config_name");
+    const testSetName = str(args, "test_set_name");
+    const mode = (optStr(args, "mode") ?? "existing") as "existing" | "prompt_test";
+    const inlinePrompt = optStr(args, "prompt");
+    const versionNumber = args.version_number != null ? Number(args.version_number) : undefined;
+    const batchSize = Math.min(Number(args.batch_size ?? 5), 20);
+
+    if (inlinePrompt && versionNumber !== undefined) {
+      return ok("Provide either version_number or prompt, not both. Use version_number when testing a versioned candidate — it records full traceability.");
+    }
+
+    // Resolve the prompt text and version metadata
+    let prompt: string | undefined = inlinePrompt;
+    let promptVersionNumber: number | undefined;
+    let promptVersionStatus: "candidate" | "deployed" | undefined;
+
+    if (versionNumber !== undefined) {
+      const snapshots = storage.listVersionSnapshots(configName);
+      const snapshot = snapshots.find((s) => s.version === versionNumber);
+      if (!snapshot) {
+        const available = snapshots.map((s) => s.version).join(", ") || "none";
+        throw new Error(`Version ${versionNumber} not found in version-history for "${configName}". Available: ${available}`);
+      }
+      prompt = snapshot.setting.prompt;
+      promptVersionNumber = snapshot.version;
+      promptVersionStatus = snapshot.status ?? "deployed";
+    } else {
+      // No version_number specified — try to resolve from latest snapshot for traceability
+      const snapshots = storage.listVersionSnapshots(configName);
+      if (snapshots.length > 0) {
+        const latest = snapshots[snapshots.length - 1];
+        if (!prompt) prompt = latest.setting.prompt; // for existing mode
+        promptVersionNumber = latest.version;
+        promptVersionStatus = latest.status ?? "deployed";
+      }
+    }
+
+    if (mode === "prompt_test" && !prompt) {
+      return ok('mode "prompt_test" requires either a version_number (recommended) or a prompt argument.');
+    }
+
+    const testSet = storage.getTestSet(configName, testSetName);
+    if (!testSet) throw new Error(`Test set not found: ${testSetName}`);
+
+    const testCases = testSet.testCaseNames.map((name) => {
+      const tc = storage.getTestCase(configName, name);
+      if (!tc) throw new Error(`Test case not found: ${name}`);
+      return tc;
+    });
+
+    // Build per-transcript payload (parallel for prompt_test, sequential for existing)
+    let transcriptPayloads: Array<{
+      transcriptId: string;
+      transcriptLabel: string;
+      plainText: string;
+      summary: string;
+    }> = [];
+
+    const previewConcurrency = Math.min(Number(args.concurrency ?? 5), 10);
+    // Production structure, candidate prompt. Only read the live setting when previews will
+    // actually be generated — mode="existing" must stay free of Genesys API calls.
+    const previewBase = mode === "existing" ? null : await loadLiveSettingForPreview(configName);
+    const previewSetting: SummarySetting = buildPreviewSetting({
+      base: previewBase,
+      name: testSetName,
+      prompt: prompt!,
+      language: optStr(args, "language"),
+      timeoutDuration: 50,
+    });
+
+    if (mode === "existing") {
+      for (const tId of testSet.transcriptIds) {
+        const stored = storage.getLifecycleTranscript(configName, tId);
+        if (!stored || !stored.existingSummary) continue;
+        transcriptPayloads.push({
+          transcriptId: tId,
+          transcriptLabel: stored.label,
+          plainText: stored.plainText,
+          summary: stored.existingSummary,
+        });
+      }
+    } else {
+      // mode: prompt_test — use disk cache if available, otherwise generate in parallel
+      const previewCache = promptVersionNumber !== undefined
+        ? storage.loadPreviewCache(configName, testSetName, promptVersionNumber)
+        : {};
+
+      const queue = testSet.transcriptIds
+        .map((tId) => ({ tId, stored: storage.getLifecycleTranscript(configName, tId) }))
+        .filter((x): x is { tId: string; stored: NonNullable<typeof x.stored> } => x.stored != null);
+
+      const uncached = queue.filter(({ tId }) => !(tId in previewCache));
+
+      if (uncached.length > 0 && promptVersionNumber !== undefined) {
+        // Summaries not yet cached — prompt user to run prepare_prompt_test first
+        const total = queue.length;
+        const cached = total - uncached.length;
+        return ok(
+          `${cached}/${total} preview summaries are cached for version ${promptVersionNumber}.\n` +
+          `${uncached.length} remain. Call prepare_prompt_test first to build the full cache, then retry start_eval_run.\n\n` +
+          `prepare_prompt_test(summary_config_name="${configName}", test_set_name="${testSetName}", version_number=${promptVersionNumber})`,
+        );
+      }
+
+      const inFlight: Promise<void>[] = [];
+      let authFailed = false;
+      let idx = 0;
+
+      while ((idx < uncached.length || inFlight.length > 0) && !authFailed) {
+        while (inFlight.length < previewConcurrency && idx < uncached.length && !authFailed) {
+          const { tId, stored } = uncached[idx++];
+          const p: Promise<void> = (async () => {
+            const response = await generatePreviewSummary(stored.plainText, previewSetting);
+            if (response === null) {
+              authFailed = true;
+              return;
+            }
+            transcriptPayloads.push({
+              transcriptId: tId,
+              transcriptLabel: stored.label,
+              plainText: stored.plainText,
+              summary: extractSummaryText(response),
+            });
+          })().then(() => {
+            inFlight.splice(inFlight.indexOf(p), 1);
+          });
+          inFlight.push(p);
+        }
+        if (inFlight.length > 0) await Promise.race(inFlight);
+      }
+      await Promise.all(inFlight);
+
+      if (authFailed) {
+        return ok("No user token available for preview generation. Call login first, then retry.");
+      }
+
+      // Add cached entries for transcripts that were pre-generated
+      for (const { tId, stored } of queue) {
+        if (tId in previewCache && !transcriptPayloads.find((p) => p.transcriptId === tId)) {
+          transcriptPayloads.push({
+            transcriptId: tId,
+            transcriptLabel: stored.label,
+            plainText: stored.plainText,
+            summary: previewCache[tId],
+          });
+        }
+      }
+
+      // Clear the cache after a successful run is created
+      if (promptVersionNumber !== undefined) {
+        storage.clearPreviewCache(configName, testSetName, promptVersionNumber);
+      }
+    }
+
+    if (transcriptPayloads.length === 0) {
+      return ok(
+        mode === "existing"
+          ? `No transcripts in "${testSetName}" have an existingSummary. Run fetch_existing_summaries_bulk first.`
+          : `No transcripts found in "${testSetName}".`,
+      );
+    }
+
+    // Drop transcripts Genesys refused to summarise. No prompt can change that output, so
+    // scoring them measures nothing — they are excluded from batching and from every
+    // denominator regardless of any dimension's applicabilityCondition.
+    const skippedTranscripts: SkippedTranscript[] = [];
+    const scorablePayloads = transcriptPayloads.filter((t) => {
+      if (!isTooShortToSummarise(t.summary)) return true;
+      skippedTranscripts.push({
+        transcriptId: t.transcriptId,
+        transcriptLabel: t.transcriptLabel,
+        summary: t.summary,
+        reason: "Genesys returned the too-short-to-summarise placeholder instead of a summary",
+      });
+      return false;
+    });
+
+    if (scorablePayloads.length === 0) {
+      return ok(
+        `Every transcript in "${testSetName}" (${skippedTranscripts.length}) returned ` +
+        `"${TOO_SHORT_SUMMARY_MESSAGE}", so there is nothing to score and no run was created.\n\n` +
+        skippedTranscripts.map((s) => `  • ${s.transcriptLabel} (${s.transcriptId})`).join("\n") +
+        `\n\nThese interactions are too brief for the summary engine to act on. Add longer ` +
+        `interactions to the test set with add_transcript_to_test_set, then start the run again.`,
+      );
+    }
+
+    transcriptPayloads = scorablePayloads;
+
+    // Recorded on the run so the report can name the language the previews were generated
+    // in, and the setting type they were generated under. It deliberately says nothing
+    // about format or insights: those never reach the model, so mentioning them only
+    // invited the reader to excuse a formatting failure as a preview artefact.
+    const previewStructure = mode === "existing"
+      ? "n/a — evaluating existing production summaries"
+      : describePreviewBase(previewBase);
+    const settingTypeWarning = unsupportedSettingTypeWarning(previewBase);
+
+    // Create the disk-backed run (claims the run number atomically)
+    const pendingMeta = storage.createPendingEvalRun(configName, testSetName, {
+      summaryConfigName: configName,
+      testSetName,
+      useExistingSummaries: mode === "existing",
+      transcriptIds: transcriptPayloads.map((t) => t.transcriptId),
+      skippedTranscripts: skippedTranscripts.length > 0 ? skippedTranscripts : undefined,
+      testCaseNames: testSet.testCaseNames,
+      startedAt: new Date().toISOString(),
+      promptText: prompt,
+      promptVersionNumber,
+      promptVersionStatus,
+      previewStructure,
+    });
+
+    // Freeze the exact text this run scores, so submit_eval_scores and get_eval_batch have an
+    // authoritative source rather than trusting whatever a scorer echoes back. Essential for
+    // prompt_test, whose summaries exist nowhere else once the preview cache is cleared below.
+    storage.saveRunSummaries(
+      configName,
+      testSetName,
+      pendingMeta.runNumber,
+      Object.fromEntries(transcriptPayloads.map((t) => [t.transcriptId, t.summary])),
+    );
+
+    // Split into batches
+    const batches: Array<{
+      batchIndex: number;
+      transcripts: typeof transcriptPayloads;
+    }> = [];
+    for (let i = 0; i < transcriptPayloads.length; i += batchSize) {
+      batches.push({
+        batchIndex: Math.floor(i / batchSize),
+        transcripts: transcriptPayloads.slice(i, i + batchSize),
+      });
+    }
+
+    const testCaseSummary = testCases.map((tc) => ({
+      name: tc.name,
+      description: tc.description,
+      dimensions: tc.dimensions.map((d) => ({
+        name: d.name,
+        description: d.description,
+        weight: d.weight,
+        applicability_condition: d.applicabilityCondition ?? "always",
+        pass_criteria: d.passCriteria,
+        fail_criteria: d.failCriteria,
+        pass_threshold: d.passThreshold ?? 0.8,
+        requirement_ids: d.requirementIds ?? [],
+      })),
+    }));
+
+    const versionLabel = promptVersionNumber !== undefined
+      ? `v${promptVersionNumber}${promptVersionStatus ? ` (${promptVersionStatus})` : ""}`
+      : "unversioned";
+
+    return json({
+      run_number: pendingMeta.runNumber,
+      summary_config_name: configName,
+      test_set_name: testSetName,
+      mode,
+      prompt_version: versionLabel,
+      prompt_version_number: promptVersionNumber ?? null,
+      prompt_version_status: promptVersionStatus ?? null,
+      prompt_text: prompt ?? null,
+      total_transcripts: transcriptPayloads.length,
+      preview_structure: previewStructure,
+      ...(settingTypeWarning ? { warning: settingTypeWarning } : {}),
+      skipped_transcripts: skippedTranscripts.length,
+      skipped_detail: skippedTranscripts.map((s) => ({
+        transcript_id: s.transcriptId,
+        transcript_label: s.transcriptLabel,
+        reason: s.reason,
+      })),
+      total_test_cases: testCases.length,
+      total_batches: batches.length,
+      batch_size: batchSize,
+      test_cases: testCaseSummary,
+      batches,
+      instruction:
+        spawnInstructionBrief() + " " +
+        "Each subagent receives its batch of transcripts and the test_cases array above. " +
+        "For each transcript in its batch, the subagent scores every dimension of every test case " +
+        "and calls submit_eval_scores for each (transcript × test_case) pair. " +
+        "APPLICABILITY CHECK — for each dimension, check its applicability_condition field first: " +
+        "(1) If applicability_condition is \"always\": score normally (0.0–1.0). " +
+        "(2) If applicability_condition is anything else: first determine whether this condition applies to the transcript. " +
+        "If YES it applies → score normally. " +
+        "If NO it does not apply → submit score: null with reasoning explaining why it is not applicable. " +
+        "Null scores are excluded from pass-rate calculations — only submit null when the condition genuinely does not apply. " +
+        (skippedTranscripts.length > 0
+          ? `NOTE: ${skippedTranscripts.length} transcript(s) were excluded from the batches above because Genesys ` +
+            `returned "${TOO_SHORT_SUMMARY_MESSAGE}" instead of a summary. They are listed under skipped_detail, ` +
+            "are absent from every pass-rate denominator, and must not be scored — the exclusion overrides " +
+            "applicabilityCondition, including \"always\". Mention the count when reporting results. "
+          : "") +
+        "After all subagents complete, call finalize_eval_run(summary_config_name, test_set_name, run_number) " +
+        "to compute aggregate pass rates and mark the run complete.",
+    });
+  });
+}
+
+/**
+ * Serves a scoring subagent the data for its own batch.
+ *
+ * WHY THIS EXISTS
+ * ---------------
+ * Scorers previously received their transcripts and rubrics inlined into the prompt the
+ * parent constructed. For a full suite that is every summary plus every dimension of
+ * every test case in one message, which is slow to assemble, blows out the stage's
+ * budget, and — when a stage timed out and the parent patched the gaps by hand — led to
+ * descriptions being substituted for the real summaries.
+ *
+ * Passing identifiers and letting the scorer fetch is both smaller and safer: the text
+ * it judges is then the same frozen text submit_eval_scores records.
+ */
+export async function get_eval_batch(args: Args) {
+  const configName = str(args, "summary_config_name");
+  const testSetName = str(args, "test_set_name");
+  const runNumber = Number(args.run_number);
+  const requested = Array.isArray(args.transcript_ids) ? args.transcript_ids.map(String) : null;
+
+  const pending = storage.getPendingEvalRun(configName, testSetName, runNumber);
+  if (!pending) {
+    throw new Error(
+      `Eval run ${runNumber} not found for "${testSetName}". The parent must call start_eval_run first.`,
+    );
+  }
+
+  const summaries = storage.loadRunSummaries(configName, testSetName, runNumber);
+  const ids = requested ?? pending.transcriptIds;
+
+  const unknown = ids.filter((id) => !pending.transcriptIds.includes(id));
+  if (unknown.length > 0) {
+    throw new Error(
+      `Not part of run ${runNumber}: ${unknown.join(", ")}. ` +
+      `Score only the transcript ids your parent assigned you. ` +
+      (pending.skippedTranscripts?.some((s) => unknown.includes(s.transcriptId))
+        ? "At least one of these was excluded for being too short to summarise."
+        : ""),
+    );
+  }
+
+  const testCases = pending.testCaseNames.map((name) => {
+    const tc = storage.getTestCase(configName, name);
+    if (!tc) throw new Error(`Test case not found: ${name}`);
+    return {
+      name: tc.name,
+      description: tc.description,
+      dimensions: tc.dimensions.map((d) => ({
+        name: d.name,
+        description: d.description,
+        weight: d.weight,
+        applicability_condition: d.applicabilityCondition ?? "always",
+        pass_criteria: d.passCriteria,
+        fail_criteria: d.failCriteria,
+        pass_threshold: d.passThreshold ?? 0.8,
+      })),
+    };
+  });
+
+  const transcripts = ids.map((id) => {
+    const stored = storage.getLifecycleTranscript(configName, id);
+    return {
+      transcript_id: id,
+      transcript_label: stored?.label ?? id,
+      summary: summaries[id] ?? stored?.existingSummary ?? "",
+    };
+  });
+
+  const missing = transcripts.filter((t) => !t.summary).map((t) => t.transcript_id);
+
+  return json({
+    run_number: runNumber,
+    summary_config_name: configName,
+    test_set_name: testSetName,
+    mode: pending.useExistingSummaries ? "existing" : "prompt_test",
+    transcripts,
+    test_cases: testCases,
+    expected_submissions: transcripts.length * testCases.length,
+    missing_summaries: missing.length > 0 ? missing : undefined,
+    note:
+      `Score every one of these ${transcripts.length} transcripts against all ` +
+      `${testCases.length} test cases, then call submit_eval_scores once per pair ` +
+      `(${transcripts.length * testCases.length} calls). You do not need to pass ` +
+      `summary_text — the run already holds the exact text being scored.` +
+      (missing.length > 0
+        ? ` STOP and report instead of scoring: no stored summary for ${missing.join(", ")}.`
+        : ""),
+  });
+}
+
+/**
+ * Score coverage for a run: how many transcript × test-case records exist against how
+ * many the run demands, and exactly which are absent.
+ *
+ * WHY THIS IS NEEDED
+ * ------------------
+ * A scoring subagent can report success having written nothing — a stage on the wrong
+ * role has no submit_eval_scores at all, and one that ends in plain text delivers
+ * nothing back to its parent. "The stage finished" is therefore not evidence that its
+ * batch landed. The only way to check used to be reading the subagent's own transcript,
+ * which expires within minutes of the stage ending, so a run could become unverifiable
+ * purely by being looked at too late.
+ *
+ * Both halves of the answer are already on disk: `transcriptIds` (skipped transcripts
+ * are excluded from it) crossed with `testCaseNames`, against the per-record files
+ * submit_eval_scores writes. Nothing extra has to be tracked while a run is open.
+ */
+function computeRunCoverage(
+  configName: string,
+  pending: EvalRunPendingMeta,
+): {
+  expected: number;
+  recorded: number;
+  missing: Array<{ transcript_id: string; test_case_name: string }>;
+  missingTranscriptIds: string[];
+} {
+  const recorded = storage.getEvalScores(configName, pending.testSetName, pending.runNumber);
+  const have = new Set(recorded.map((r) => `${r.transcriptId}\u0000${r.testCaseName}`));
+
+  const missing: Array<{ transcript_id: string; test_case_name: string }> = [];
+  for (const transcriptId of pending.transcriptIds) {
+    for (const testCaseName of pending.testCaseNames) {
+      if (!have.has(`${transcriptId}\u0000${testCaseName}`)) {
+        missing.push({ transcript_id: transcriptId, test_case_name: testCaseName });
+      }
+    }
+  }
+
+  return {
+    expected: pending.transcriptIds.length * pending.testCaseNames.length,
+    recorded: recorded.length,
+    missing,
+    // What a re-run is actually keyed on: a batch is a set of transcript ids, so this is
+    // the list to hand back to use_subagent.
+    missingTranscriptIds: [...new Set(missing.map((m) => m.transcript_id))],
+  };
+}
+
+export async function submit_eval_scores(args: Args) {
+  const configName = str(args, "summary_config_name");
+  const testSetName = str(args, "test_set_name");
+  const runNumber = Number(args.run_number);
+  const transcriptId = str(args, "transcript_id");
+  const testCaseName = str(args, "test_case_name");
+  const transcriptLabel = optStr(args, "transcript_label") ?? transcriptId;
+  const callerSummary = optStr(args, "summary_text") ?? "";
+  const rawScores = Array.isArray(args.dimension_scores) ? args.dimension_scores : [];
+
+  // Verify run exists
+  const pending = storage.getPendingEvalRun(configName, testSetName, runNumber);
+  if (!pending) {
+    throw new Error(
+      `Eval run ${runNumber} not found for "${testSetName}". ` +
+      `Call start_eval_run first to create the run.`,
+    );
+  }
+
+  // WHY THE SERVER RESOLVES THIS RATHER THAN TRUSTING THE CALLER
+  // ------------------------------------------------------------
+  // The text a run scores is frozen by start_eval_run, so the caller has nothing to
+  // add. Accepting its version instead let a scorer record a placeholder — or an empty
+  // string — as the very evidence the run report quotes, with no error raised. One real
+  // baseline run stored 61 of its 126 records that way, which made every score in it
+  // impossible to review.
+  //
+  // The fallbacks cover runs created before summaries were frozen: existing mode can
+  // re-read the transcript, while a prompt_test run has no other source and has to fall
+  // back to the caller.
+  const runSummaries = storage.loadRunSummaries(configName, testSetName, runNumber);
+  let summaryText = runSummaries[transcriptId] ?? "";
+  if (!summaryText && pending.useExistingSummaries) {
+    summaryText = storage.getLifecycleTranscript(configName, transcriptId)?.existingSummary ?? "";
+  }
+  if (!summaryText) summaryText = callerSummary;
+
+  // Reject scores for transcripts with no real summary. start_eval_run keeps these out of the
+  // batches, so reaching here means a subagent scored something it was not given — recording it
+  // would put a meaningless result into the pass rate. Checked before the empty guard below,
+  // since a too-short transcript legitimately has no summary and warrants this reply instead.
+  const skipped = pending.skippedTranscripts?.find((s) => s.transcriptId === transcriptId);
+  if (skipped || isTooShortToSummarise(summaryText)) {
+    return ok(
+      `Not recorded. Transcript ${transcriptLabel} is excluded from run ${runNumber}: Genesys returned ` +
+      `"${TOO_SHORT_SUMMARY_MESSAGE}" instead of a summary, so there is nothing for a test case to assess. ` +
+      "This overrides applicabilityCondition, including \"always\". Move on to the next transcript.",
+    );
+  }
+
+  if (!summaryText.trim()) {
+    throw new Error(
+      `No summary to record against ${transcriptLabel} / ${testCaseName}. ` +
+      (pending.useExistingSummaries
+        ? `Run ${runNumber} uses existing summaries, but transcript ${transcriptId} has no ` +
+          `stored existingSummary — it should not have been in a batch. Report this rather ` +
+          `than passing summary text yourself.`
+        : `Pass the generated summary as summary_text. A score recorded without the text it ` +
+          `judged cannot be reviewed, so it is refused.`),
+    );
+  }
+
+  // Load test case to get passThreshold per dimension
+  const testCase = storage.getTestCase(configName, testCaseName);
+  if (!testCase) throw new Error(`Test case not found: ${testCaseName}`);
+
+  const thresholdMap = Object.fromEntries(
+    testCase.dimensions.map((d) => [d.name, d.passThreshold ?? 0.8]),
+  );
+
+  const dimensionScores = rawScores.map((s: unknown) => {
+    const sc = s as Record<string, unknown>;
+    const dimName = String(sc.dimension ?? "");
+    // null score = evaluator determined this dimension is not applicable to this transcript
+    if (sc.score === null || sc.score === undefined && String(sc.na ?? "") === "true") {
+      return {
+        dimension: dimName,
+        score: null as null,
+        na: true,
+        passed: true, // N/A is not a failure
+        reasoning: String(sc.reasoning ?? ""),
+      };
+    }
+    const score = Math.max(0, Math.min(1, Number(sc.score ?? 0)));
+    const threshold = thresholdMap[dimName] ?? 0.8;
+    return {
+      dimension: dimName,
+      score,
+      na: false,
+      passed: score >= threshold,
+      reasoning: String(sc.reasoning ?? ""),
+    };
+  });
+
+  // Exclude N/A dimensions from aggregate calculations
+  const scoredDims = dimensionScores.filter((d) => !d.na);
+  const overallScore =
+    scoredDims.length > 0
+      ? scoredDims.reduce((sum, d) => sum + (d.score as number), 0) / scoredDims.length
+      : 0;
+  // All-N/A transcript counts as passing (nothing was evaluated negatively)
+  const overallPassed = scoredDims.length === 0 || scoredDims.every((d) => d.passed);
+
+  storage.saveEvalScore(configName, testSetName, runNumber, {
+    testCaseName,
+    transcriptId,
+    transcriptLabel,
+    summary: summaryText,
+    dimensionScores,
+    overallPassed,
+    overallScore,
+  });
+
+  // Progress is returned on every save so a scorer can tell a complete batch from a
+  // partial one before it reports back. Submitting 25 scores otherwise yields 25
+  // unrelated confirmations and no sense of whether anything is outstanding, which is
+  // how a stage ends up claiming success with records missing.
+  const coverage = computeRunCoverage(configName, pending);
+  const perTranscriptMissing = coverage.missing.filter((m) => m.transcript_id === transcriptId);
+
+  return json({
+    saved: true,
+    transcript_id: transcriptId,
+    test_case_name: testCaseName,
+    overall_score: overallScore.toFixed(3),
+    overall_passed: overallPassed,
+    dimensions_scored: dimensionScores.length,
+    this_transcript: {
+      recorded: pending.testCaseNames.length - perTranscriptMissing.length,
+      expected: pending.testCaseNames.length,
+      still_missing: perTranscriptMissing.map((m) => m.test_case_name),
+    },
+    run_total: { recorded: coverage.recorded, expected: coverage.expected },
+    note:
+      perTranscriptMissing.length > 0
+        ? `Transcript ${transcriptLabel} still needs: ${perTranscriptMissing.map((m) => m.test_case_name).join(", ")}.`
+        : `Transcript ${transcriptLabel} is fully scored. Do not report your batch complete ` +
+          `until every transcript you were assigned reads the same.`,
+  });
+}
+
+// ─── Report generation ─────────────────────────────────────────────────────────
+
+/**
+ * Renders and writes both reports for a finalized run: the run dashboard, and the
+ * test-set-level improvements report that now includes it.
+ *
+ * Report generation is deliberately non-fatal for callers that have already written
+ * results to disk. A template bug or a half-edited requirements.md must not lose a
+ * finalized run — the scores are the record, the HTML is a derived artefact that can be
+ * regenerated at any time with regenerate_reports.
+ */
+function writeReportsForRun(
+  configName: string,
+  testSetName: string,
+  runNumber: number,
+): { dashboardPath: string | null; improvementsPath: string | null; error: string | null } {
+  try {
+    const runModel = buildRunReport(configName, testSetName, runNumber);
+    const dashboardPath = storage.saveEvalRunDashboard(
+      configName,
+      testSetName,
+      runNumber,
+      renderRunReport(runModel),
+    );
+    const improvementsModel = buildImprovementsReport(configName, testSetName);
+    const improvementsPath = storage.saveImprovementsDashboard(
+      configName,
+      testSetName,
+      renderImprovementsReport(improvementsModel),
+    );
+    return { dashboardPath, improvementsPath, error: null };
+  } catch (err) {
+    return {
+      dashboardPath: null,
+      improvementsPath: null,
+      error: err instanceof Error ? err.message : String(err),
+    };
+  }
+}
+
+export async function finalize_eval_run(args: Args) {
+  const configName = str(args, "summary_config_name");
+  const testSetName = str(args, "test_set_name");
+  const runNumber = Number(args.run_number);
+
+  const pending = storage.getPendingEvalRun(configName, testSetName, runNumber);
+  if (!pending) {
+    throw new Error(`Eval run ${runNumber} not found for "${testSetName}".`);
+  }
+
+  const scores = storage.getEvalScores(configName, testSetName, runNumber);
+
+  if (scores.length === 0) {
+    return ok(`No scores submitted for run ${runNumber} yet. Ensure all subagents have completed before finalizing.`);
+  }
+
+  // REFUSING A PARTIAL RUN
+  // ----------------------
+  // Checking only for zero scores catches the wrong failure. Kiro's crew is fail-fast:
+  // one erroring stage cancels its siblings, so the realistic outcome is *some* batches
+  // landing, not none. Finalizing then averages whatever arrived, writes a dashboard, and
+  // presents a pass rate computed over part of the suite as the run's result — a number
+  // that looks authoritative and is wrong, which is worse than no number at all.
+  const coverage = computeRunCoverage(configName, pending);
+  if (coverage.missing.length > 0 && args.allow_partial !== true) {
+    const byTranscript = coverage.missingTranscriptIds
+      .map((id) => {
+        const cases = coverage.missing.filter((m) => m.transcript_id === id).map((m) => m.test_case_name);
+        return `  • ${id} — missing ${cases.length}/${pending.testCaseNames.length}: ${cases.join(", ")}`;
+      })
+      .join("\n");
+    throw new Error(
+      `Run ${runNumber} is incomplete: ${coverage.recorded} of ${coverage.expected} scores recorded, ` +
+      `${coverage.missing.length} missing across ${coverage.missingTranscriptIds.length} transcript(s).\n\n` +
+      `${byTranscript}\n\n` +
+      `A subagent can report success having written nothing, so a finished stage is not proof its ` +
+      `batch landed — this is what that looks like. Re-run scoring for the transcript ids above, ` +
+      `then finalize once.\n\n` +
+      `If the run is genuinely meant to be partial, pass allow_partial=true. The pass rate will then ` +
+      `be computed over the ${coverage.recorded} records present, and the run will be marked partial.`,
+    );
+  }
+  const partial = coverage.missing.length > 0;
+
+  // Merge intermediate per-transcript files → one {testCaseName}.json per test case
+  const merged = storage.mergeEvalScoresToTestCaseFiles(configName, testSetName, runNumber, pending.testCaseNames);
+
+  // Aggregate overall pass rate
+  const overallPassRate = scores.filter((s) => s.overallPassed).length / scores.length;
+
+  // Per-test-case stats (from merged output)
+  const testCasePassRates: Record<string, number> = {};
+  for (const file of merged) {
+    testCasePassRates[file.testCaseName] = file.passRate;
+  }
+
+  const finalizedMeta = storage.getPendingEvalRun(configName, testSetName, runNumber)!;
+  storage.finalizePendingEvalRun(configName, testSetName, runNumber, overallPassRate, testCasePassRates, {
+    recorded: coverage.recorded,
+    expected: coverage.expected,
+    missingTranscriptIds: coverage.missingTranscriptIds,
+  });
+
+  // Auto-generate this run's dashboard and refresh the improvements report
+  const reports = writeReportsForRun(configName, testSetName, runNumber);
+
+  const breakdown = merged
+    .map((f) => `  • ${f.testCaseName}: avg ${f.averageScore.toFixed(2)} · ${(f.passRate * 100).toFixed(0)}% pass`)
+    .join("\n");
+
+  // ── Build per-dimension failure analysis for improvement recommendations ──
+  const dimFailureLines: string[] = [];
+  for (const file of merged) {
+    const dimNames = [...new Set(file.results.flatMap((r) => r.dimensionScores.map((d) => d.dimension)))];
+    for (const dimName of dimNames) {
+      // Exclude N/A dimensions from failure analysis — only count evaluated (scored) dimensions
+      const dimScores = file.results
+        .map((r) => r.dimensionScores.find((d) => d.dimension === dimName))
+        .filter((d) => d != null && !d.na);
+      if (dimScores.length === 0) continue;
+      const failing = dimScores.filter((d) => !d!.passed);
+      if (failing.length === 0) continue;
+      const dimPassPct = (((dimScores.length - failing.length) / dimScores.length) * 100).toFixed(0);
+      const sampleReasonings = failing
+        .slice(0, 3)
+        .map((d) => `    • "${d!.reasoning.length > 200 ? d!.reasoning.slice(0, 200) + "…" : d!.reasoning}"`)
+        .join("\n");
+      dimFailureLines.push(
+        `  [${file.testCaseName}] "${dimName}" — ${dimPassPct}% pass (${failing.length}/${dimScores.length} evaluated)\n` +
+        `  Sample failure reasoning:\n${sampleReasonings}`,
+      );
+    }
+  }
+  const failureAnalysis = dimFailureLines.length > 0
+    ? dimFailureLines.join("\n\n")
+    : "  (no failing dimensions — all dimensions passed)";
+
+  const versionLabel = pending.promptVersionNumber !== undefined
+    ? `Version ${pending.promptVersionNumber}${pending.promptVersionStatus ? ` (${pending.promptVersionStatus})` : ""}`
+    : "unversioned (no version_number was supplied)";
+
+  const promptSection = pending.promptText
+    ? `\n\nPROMPT UNDER TEST [${versionLabel}]:\n${"─".repeat(60)}\n${pending.promptText}\n${"─".repeat(60)}`
+    : `\n\nPROMPT UNDER TEST [${versionLabel}]:\n(Prompt text not recorded — re-run with version_number to capture it.)`;
+
+  // A partial run's rates are indistinguishable from a complete run's at a glance, so the
+  // caveat goes above them rather than in a footnote — this number must not be quoted bare.
+  const partialBanner = partial
+    ? `\n⚠ PARTIAL RUN — ${coverage.recorded} of ${coverage.expected} scores recorded. ` +
+      `Missing scores for ${coverage.missingTranscriptIds.length} transcript(s): ` +
+      `${coverage.missingTranscriptIds.slice(0, 20).join(", ")}` +
+      `${coverage.missingTranscriptIds.length > 20 ? ", …" : ""}\n` +
+      `  Every rate below covers only the records present. Do not compare it with a complete\n` +
+      `  run or quote it as this test set's pass rate without saying it is partial.\n`
+    : "";
+
+  return ok(
+    `─── Eval Run ${runNumber} Finalized ───\n` +
+    partialBanner + `\n` +
+    `Test set:        ${testSetName}\n` +
+    `Config:          ${configName}\n` +
+    `Mode:            ${pending.useExistingSummaries ? "existing summaries" : "prompt test"}\n` +
+    `Version:         ${versionLabel}\n` +
+    `Transcripts:     ${pending.transcriptIds.length}\n` +
+    (pending.skippedTranscripts?.length
+      ? `Skipped:         ${pending.skippedTranscripts.length} (too short to summarise — excluded from all pass rates)\n`
+      : "") +
+    `Results saved:   ${scores.length}${partial ? ` of ${coverage.expected} expected` : ""}\n` +
+    `Overall pass:    ${(overallPassRate * 100).toFixed(1)}%${partial ? " (partial — see above)" : ""}\n\n` +
+    `By test case:\n${breakdown}\n\n` +
+    `Output: eval-runs/${testSetName}/${String(runNumber).padStart(4, "0")}/\n` +
+    merged.map((f) => `  ${f.testCaseName}.json  (${f.totalTranscripts} transcripts)`).join("\n") + "\n\n" +
+    (reports.error
+      ? `Reports: FAILED to generate — ${reports.error}\n` +
+        `         The run itself is saved. Fix the cause and call regenerate_reports.`
+      : `Dashboard:   ${reports.dashboardPath}\n` +
+        `Improvements: ${reports.improvementsPath}`) +
+    promptSection +
+    `\n\nFAILING DIMENSION ANALYSIS:\n${failureAnalysis}` +
+    `\n\n${"═".repeat(60)}\n` +
+    `NEXT STEP — IMPROVEMENT RECOMMENDATIONS\n` +
+    `${"═".repeat(60)}\n` +
+    `Summaries for this run were generated by: ${SUMMARY_MODEL_NAME}\n\n` +
+    `Using the prompt and failing dimension analysis above, write improvements.md for this run.\n\n` +
+    `improvements.md must follow this structure:\n` +
+    `  1. Run Summary — overall pass rate, test set, date, model, mode\n` +
+    `  2. Test Case Results — table of test case / pass rate / avg score\n` +
+    `  3. Failing Dimension Analysis — for each failing dimension:\n` +
+    `       - What the dimension tests (from passCriteria)\n` +
+    `       - Pattern in the failures (synthesized from the reasoning samples above)\n` +
+    `       - Root cause: what is the prompt missing or doing wrong for ${SUMMARY_MODEL_NAME}?\n` +
+    `  4. Prompt Improvement Suggestions — specific, actionable edits to the prompt:\n` +
+    `       - Use concrete phrasing (e.g. "Add the sentence: You MUST always...")\n` +
+    `       - Prefer explicit instructions over implicit expectations\n` +
+    `       - Note any ${SUMMARY_MODEL_NAME}-specific considerations (e.g. tendency to be terse,\n` +
+    `         follow instructions literally, omit context if not told to include it)\n` +
+    `  5. Proposed Improved Prompt — the full revised prompt text as a fenced code block\n\n` +
+    `When your improvements.md is ready, call:\n` +
+    `  save_improvement_recommendations(\n` +
+    `    summary_config_name="${configName}",\n` +
+    `    test_set_name="${testSetName}",\n` +
+    `    run_number=${runNumber},\n` +
+    `    content="<your improvements.md content>"\n` +
+    `  )`,
+  );
+}
+
+export async function save_improvement_recommendations(args: Args) {
+  const configName = str(args, "summary_config_name");
+  const testSetName = str(args, "test_set_name");
+  const runNumber = Number(args.run_number);
+  const content = str(args, "content");
+
+  if (!content.trim()) {
+    throw new Error("content must not be empty.");
+  }
+
+  const runDir = `eval-runs/${testSetName}/${String(runNumber).padStart(4, "0")}`;
+  const pending = storage.getPendingEvalRun(configName, testSetName, runNumber);
+  if (!pending) {
+    throw new Error(`Eval run ${runNumber} not found for "${testSetName}". Run finalize_eval_run first.`);
+  }
+  if (!pending.finalizedAt) {
+    throw new Error(`Eval run ${runNumber} has not been finalized yet. Call finalize_eval_run first.`);
+  }
+
+  const filePath = storage.saveImprovementRecommendations(configName, testSetName, runNumber, content);
+  return ok(
+    `Improvement recommendations saved to ${filePath}\n` +
+    `Run: ${runDir}\n` +
+    `Open improvements.md in that folder to review the analysis.`,
+  );
+}
+
+export async function generate_eval_run_dashboard(args: Args) {
+  const configName = str(args, "summary_config_name");
+  const testSetName = str(args, "test_set_name");
+  const runNumber = Number(args.run_number);
+
+  const model = buildRunReport(configName, testSetName, runNumber);
+  const dashboardPath = storage.saveEvalRunDashboard(
+    configName,
+    testSetName,
+    runNumber,
+    renderRunReport(model),
+  );
+
+  return ok(
+    `Run dashboard generated: ${dashboardPath}\n\n` +
+    `Run ${runNumber} — ${Math.round(model.headline.passRate * 100)}% of interactions passed every test case\n` +
+    `Weighted score: ${model.headline.stats.weightedScore?.toFixed(2) ?? "—"} ` +
+    `(unweighted ${model.headline.stats.averageScore?.toFixed(2) ?? "—"})\n` +
+    `${model.testCases.length} test cases · ${model.headline.transcriptsEvaluated} interactions · ` +
+    `${model.findings.length} findings\n` +
+    (model.coverage.requirementsUnavailable
+      ? `Requirements pivot unavailable — requirements/final/requirements.md was not found.\n`
+      : `Requirement coverage: ${model.coverage.requirementsCovered}/${model.coverage.requirementsTotal}` +
+        (model.coverage.uncoveredRequirementIds.length
+          ? ` (untested: ${model.coverage.uncoveredRequirementIds.join(", ")})`
+          : "") + "\n") +
+    `\nOpen the file in a browser. Every view is self-contained — no server needed.`,
+  );
+}
+
+export async function generate_improvements_dashboard(args: Args) {
+  const configName = str(args, "summary_config_name");
+  const testSetName = str(args, "test_set_name");
+
+  const model = buildImprovementsReport(configName, testSetName);
+  const filePath = storage.saveImprovementsDashboard(
+    configName,
+    testSetName,
+    renderImprovementsReport(model),
+  );
+
+  const trend = model.runs
+    .map((r) => `Run ${r.runNumber} (${r.passRate === null ? "—" : Math.round(r.passRate * 100) + "%"})`)
+    .join(" → ");
+
+  return ok(
+    `Improvements report generated: ${filePath}\n\n` +
+    `Covers ${model.runs.length} run${model.runs.length !== 1 ? "s" : ""}: ${trend}\n` +
+    `Watchlist: ${model.watchlist.length} unresolved item${model.watchlist.length === 1 ? "" : "s"} in the latest run\n` +
+    `Changelog: ${model.changelog.filter((c) => c.promptDiff.added || c.promptDiff.removed).length} runs with prompt changes`,
+  );
+}
+
+/**
+ * The closing report for an accepted cycle.
+ *
+ * Everything measurable is rebuilt from the runs; the narrative arguments are the part no
+ * tool can derive — why each change was made and what it bought. They are stored as data
+ * next to the runs so the page can be re-rendered later with a newer template.
+ */
+export async function generate_rollup_report(args: Args) {
+  const configName = str(args, "summary_config_name");
+  const testSetName = str(args, "test_set_name");
+
+  const themes = Array.isArray(args.themes)
+    ? (args.themes as Array<Record<string, unknown>>).map((t, idx) => {
+        const title = typeof t.title === "string" ? t.title.trim() : "";
+        if (!title) throw new Error(`themes[${idx}] is missing a title.`);
+        return {
+          title,
+          issue: typeof t.issue === "string" ? t.issue : "",
+          approach: typeof t.approach === "string" ? t.approach : "",
+          benefit: typeof t.benefit === "string" ? t.benefit : "",
+          metric: typeof t.metric === "string" && t.metric.trim() !== "" ? t.metric.trim() : null,
+        };
+      })
+    : [];
+
+  const strings = (key: string): string[] =>
+    Array.isArray(args[key])
+      ? (args[key] as unknown[]).filter((s): s is string => typeof s === "string" && s.trim() !== "")
+      : [];
+
+  const summary = typeof args.executive_summary === "string" ? args.executive_summary.trim() : "";
+
+  // A narrative is only written when something was actually supplied, so re-rendering a
+  // rollup without narrative arguments cannot wipe one that was authored earlier.
+  let narrativePath: string | null = null;
+  if (summary !== "" || themes.length > 0 || strings("next_steps").length > 0) {
+    narrativePath = storage.saveRollupNarrative(configName, testSetName, {
+      executiveSummary: summary,
+      themes,
+      methodologyNotes: strings("methodology_notes"),
+      nextSteps: strings("next_steps"),
+      authoredAt: new Date().toISOString(),
+    });
+  }
+
+  const model = buildRollupReport(configName, testSetName);
+  const filePath = storage.saveRollupReport(configName, testSetName, renderRollupReport(model));
+
+  const impl = model.implemented;
+  const pctOf = (v: number | null) => (v === null ? "—" : `${Math.round(v * 100)}%`);
+
+  const lines = [
+    `Rollup report generated: ${filePath}`,
+    narrativePath ? `Narrative saved: ${narrativePath}` : null,
+    "",
+    `Config:     ${configName}`,
+    `Test set:   ${testSetName}`,
+    `Runs:       ${model.runs.length}`,
+    `Baseline:   run ${model.baseline?.runNumber} — ${pctOf(model.headline.baselinePassRate)}`,
+    impl
+      ? `Implemented: v${impl.versionNumber ?? "?"} — ${pctOf(impl.passRate)}` +
+        (impl.runNumber === null ? " (no run measured this prompt)" : ` (run ${impl.runNumber})`) +
+        (impl.rollbackVersion === null ? "" : `, rollback snapshot ${impl.rollbackVersion}`)
+      : "Implemented: nothing from this cycle is live in Genesys",
+    `Movement:   ${model.headline.delta === null ? "—" : (model.headline.delta >= 0 ? "+" : "−") + pctOf(Math.abs(model.headline.delta))} overall — ` +
+      `${model.headline.testCasesImproved} test cases improved, ${model.headline.testCasesHeld} held, ` +
+      `${model.headline.testCasesRegressed} regressed`,
+    `Still open: ${model.outstanding.length} item${model.outstanding.length === 1 ? "" : "s"} in the implemented run`,
+  ].filter((l): l is string => l !== null);
+
+  if (impl && model.best && impl.runNumber !== null && model.best.runNumber !== impl.runNumber) {
+    lines.push(
+      "",
+      `NOTE: run ${model.best.runNumber} scored ${pctOf(model.best.passRate)}, above the implemented ` +
+      `run ${impl.runNumber} (${pctOf(impl.passRate)}). The report outlines the implemented column in ` +
+      `the pass-rate matrix and states this difference, so tell the user if it was deliberate.`,
+    );
+  }
+
+  if (model.narrative === null) {
+    lines.push(
+      "",
+      "NO NARRATIVE RECORDED. The report renders the measurements but reads as an empty account. " +
+      "Call this tool again with executive_summary, themes and next_steps.",
+    );
+  }
+
+  return ok(lines.join("\n"));
+}
+
+/**
+ * Rebuilds every report for a config from the results on disk.
+ *
+ * This is what makes the templates shippable: reports are derived artefacts, so pulling a
+ * newer version of this plugin and running this brings historical runs into the current
+ * views without re-scoring anything.
+ */
+export async function regenerate_reports(args: Args) {
+  const configName = str(args, "summary_config_name");
+  const only = args.test_set_name ? str(args, "test_set_name") : null;
+
+  const testSetNames = [
+    ...new Set(
+      storage
+        .listEvalRuns(configName)
+        .map((r) => r.testSetName)
+        .filter((name) => only === null || name === only),
+    ),
+  ].sort();
+
+  if (testSetNames.length === 0) {
+    throw new Error(
+      only
+        ? `No finalized runs found for test set "${only}" in "${configName}".`
+        : `No finalized runs found for "${configName}". Nothing to regenerate.`,
+    );
+  }
+
+  const lines: string[] = [];
+  let runsRebuilt = 0;
+  let failures = 0;
+
+  for (const testSetName of testSetNames) {
+    const metas = storage.readAllFinalizedRunMetas(configName, testSetName);
+    for (const meta of metas) {
+      try {
+        storage.saveEvalRunDashboard(
+          configName,
+          testSetName,
+          meta.runNumber,
+          renderRunReport(buildRunReport(configName, testSetName, meta.runNumber)),
+        );
+        runsRebuilt++;
+      } catch (err) {
+        failures++;
+        lines.push(
+          `  ✗ ${testSetName} run ${meta.runNumber}: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
+    try {
+      const path = storage.saveImprovementsDashboard(
+        configName,
+        testSetName,
+        renderImprovementsReport(buildImprovementsReport(configName, testSetName)),
+      );
+      lines.push(`  ✓ ${testSetName}: ${metas.length} run report${metas.length === 1 ? "" : "s"} + ${path}`);
+    } catch (err) {
+      failures++;
+      lines.push(
+        `  ✗ ${testSetName} improvements: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+
+    // A rollup is only rebuilt where one was authored — its narrative is the record, and a
+    // test set with no narrative has no rollup to bring forward.
+    if (storage.loadRollupNarrative(configName, testSetName) !== null) {
+      try {
+        const path = storage.saveRollupReport(
+          configName,
+          testSetName,
+          renderRollupReport(buildRollupReport(configName, testSetName)),
+        );
+        lines.push(`  ✓ ${testSetName}: ${path}`);
+      } catch (err) {
+        failures++;
+        lines.push(`  ✗ ${testSetName} rollup: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+  }
+
+  return ok(
+    `─── Reports Regenerated ───\n\n` +
+    `Config:     ${configName}\n` +
+    `Test sets:  ${testSetNames.length}\n` +
+    `Run reports: ${runsRebuilt}\n` +
+    (failures > 0 ? `Failures:   ${failures}\n` : "") +
+    `\n${lines.join("\n")}\n\n` +
+    `Reports are rebuilt from the results on disk, so nothing was re-scored and no ` +
+    `Genesys calls were made.`,
+  );
+}
+
+// ─── Pipeline state ────────────────────────────────────────────────────────────
+
+/**
+ * Where a configuration actually is, read from disk.
+ *
+ * This exists to settle one question cheaply: does an instruction still apply? A gate
+ * answer, a resumed session, or a queued question delivered hours late all arrive with no
+ * indication of when they were composed, and their wording carries the state at that
+ * moment — "create candidate v1", "build v3". Acted on blind, they walk a finished cycle
+ * backwards. Compared against this, they are obviously stale.
+ *
+ * Reads only local files: no Genesys calls, so it is safe to call before anything else and
+ * as often as needed.
+ */
+export async function get_pipeline_state(args: Args) {
+  const configName = str(args, "summary_config_name");
+
+  if (!storage.listLifecycleConfigs().includes(configName)) {
+    return json({
+      summary_config_name: configName,
+      workspace_exists: false,
+      stage: "no-workspace",
+      note:
+        `No lifecycle workspace exists for "${configName}". Existing configs: ` +
+        (storage.listLifecycleConfigs().join(", ") || "(none)"),
+    });
+  }
+
+  // Heals a workspace created before a scaffold directory or its README existed.
+  // build_interaction_filter is the only other caller, and a project already past
+  // that step would otherwise never gain them. Idempotent, and never overwrites.
+  storage.ensureAllLifecycleDirs(configName);
+
+  const versions = storage.listVersionSnapshots(configName);
+  const latestVersion = versions.length > 0 ? versions[versions.length - 1] : null;
+  const latestDeployed = [...versions].reverse().find((v) => (v.status ?? "deployed") === "deployed") ?? null;
+  const runs = storage.listRunStates(configName);
+  const unfinalised = runs.filter((r) => r.finalizedAt === null);
+  const finalised = runs.filter((r) => r.finalizedAt !== null);
+  const requirements = loadRequirements(configName);
+  const filter = storage.loadInteractionFilter(configName);
+
+  // Versions above the newest deployed one are prompts authored but never pushed live.
+  const untestedCandidates = versions.filter(
+    (v) =>
+      v.status === "candidate" &&
+      !finalised.some((r) => r.promptVersionNumber === v.version),
+  );
+  const testedNotDeployed = versions.filter(
+    (v) =>
+      v.status === "candidate" &&
+      finalised.some((r) => r.promptVersionNumber === v.version) &&
+      (latestDeployed === null || v.version > latestDeployed.version),
+  );
+
+  // A single label for "what step are we on", so a stale instruction naming a different
+  // step is immediately recognisable.
+  const stage = (() => {
+    if (unfinalised.length > 0) return "eval-run-in-progress";
+    if (requirements.unavailable) return "requirements-not-authored";
+    if (storage.listTestCases(configName).length === 0) return "test-cases-not-authored";
+    if (finalised.length === 0) return "no-eval-runs-yet";
+    if (untestedCandidates.length > 0) return "candidate-authored-not-tested";
+    if (testedNotDeployed.length > 0) return "candidate-tested-awaiting-deployment-decision";
+    return "deployed-cycle-complete";
+  })();
+
+  return json({
+    summary_config_name: configName,
+    workspace_exists: true,
+    stage,
+    read_at: new Date().toISOString(),
+    summary_setting_id: filter?.summarySettingId ?? null,
+
+    versions: {
+      latest: latestVersion
+        ? {
+            version: latestVersion.version,
+            status: latestVersion.status ?? "deployed",
+            snapshot_at: latestVersion.snapshotAt,
+            notes: latestVersion.notes ?? null,
+            prompt_length: latestVersion.setting.prompt.length,
+          }
+        : null,
+      latest_deployed: latestDeployed
+        ? { version: latestDeployed.version, snapshot_at: latestDeployed.snapshotAt }
+        : null,
+      total: versions.length,
+      candidates_never_tested: untestedCandidates.map((v) => v.version),
+      candidates_tested_not_deployed: testedNotDeployed.map((v) => v.version),
+    },
+
+    runs: {
+      total: runs.length,
+      finalized: finalised.length,
+      // Score coverage is reported here because this is where the orchestration guidance
+      // sends you to find out what landed. A finished scoring stage is not evidence its
+      // batch was recorded, and the subagent transcript that could once confirm it expires
+      // within minutes — so the run's own files have to be able to answer.
+      in_progress: unfinalised.map((r) => {
+        const pending = storage.getPendingEvalRun(configName, r.testSetName, r.runNumber);
+        const coverage = pending ? computeRunCoverage(configName, pending) : null;
+        return {
+          test_set_name: r.testSetName,
+          run_number: r.runNumber,
+          started_at: r.startedAt,
+          scores: coverage
+            ? {
+                recorded: coverage.recorded,
+                expected: coverage.expected,
+                complete: coverage.missing.length === 0,
+                missing_count: coverage.missing.length,
+                // The ids to re-batch. Capped so a run that recorded nothing does not
+                // bury the rest of the state in a list of every transcript.
+                missing_transcript_ids: coverage.missingTranscriptIds.slice(0, 40),
+                missing_transcript_ids_truncated: coverage.missingTranscriptIds.length > 40,
+              }
+            : null,
+          note:
+            coverage === null
+              ? "Started but never finalized, and its metadata could not be read."
+              : coverage.missing.length === 0
+                ? "All scores recorded — safe to call finalize_eval_run."
+                : `Incomplete: ${coverage.recorded}/${coverage.expected} scores recorded. Re-run scoring ` +
+                  `for missing_transcript_ids, then finalize. finalize_eval_run refuses a partial run ` +
+                  `unless allow_partial=true.`,
+        };
+      }),
+      latest_finalized: finalised[0]
+        ? {
+            test_set_name: finalised[0].testSetName,
+            run_number: finalised[0].runNumber,
+            mode: finalised[0].mode,
+            prompt_version: finalised[0].promptVersionNumber,
+            prompt_version_status: finalised[0].promptVersionStatus,
+            pass_rate: finalised[0].aggregatePassRate,
+            finalized_at: finalised[0].finalizedAt,
+          }
+        : null,
+      by_test_set: [...new Set(runs.map((r) => r.testSetName))].map((name) => {
+        const forSet = finalised.filter((r) => r.testSetName === name);
+        return {
+          test_set_name: name,
+          highest_run_number: Math.max(...runs.filter((r) => r.testSetName === name).map((r) => r.runNumber)),
+          finalized_runs: forSet.length,
+          pass_rate_history: forSet
+            .slice()
+            .reverse()
+            .map((r) => ({ run: r.runNumber, version: r.promptVersionNumber, pass_rate: r.aggregatePassRate })),
+        };
+      }),
+    },
+
+    artefacts: {
+      requirements: requirements.unavailable ? null : requirements.requirements.length,
+      test_cases: storage.listTestCases(configName).length,
+      test_sets: storage.listTestSets(configName).map((t) => t.name),
+      transcripts: storage.listLifecycleTranscripts(configName).length,
+    },
+
+    staleness_check:
+      "Compare any instruction that names a version or run number against this. An " +
+      "instruction referring to a version at or below versions.latest.version, or a run at " +
+      "or below runs.by_test_set[].highest_run_number, describes work that has already " +
+      "happened — do not redo it. Report the mismatch to the user and ask what they want " +
+      "instead of acting on it.",
+  });
+}
+
+// ─── Pipeline guide ────────────────────────────────────────────────────────────
+
+export async function get_pipeline_guide(_args: Args) {
+  return { content: [{ type: "text" as const, text: FULL_PIPELINE_GUIDE }] };
+}
