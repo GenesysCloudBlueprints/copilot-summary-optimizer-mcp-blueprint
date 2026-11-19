@@ -1,10 +1,16 @@
-# Copilot Summary Optimizer — Genesys Cloud Summary Prompt Testing Pipeline
+# Copilot Summary Optimizer
 
-A tooling bundle for developing, testing, and iteratively improving Genesys Cloud Agent Copilot / AI Studio summary prompts. It works in Kiro and in Cursor.
+> View this blueprint in the Genesys Cloud Developer Center at
+> [Copilot Summary Optimizer](https://developer.genesys.cloud/blueprints/copilot-summary-optimizer-mcp-blueprint/ "Goes to the Copilot Summary Optimizer blueprint page")
 
-It ships an MCP server plus the pipeline guidance the agent needs to orchestrate...
+This Genesys Cloud Developer Blueprint provides the Copilot Summary Optimizer, a Model Context Protocol (MCP) server that connects an AI coding assistant to the Genesys Cloud Platform API so you can test and improve Agent Copilot summary prompts against your own interaction data. It retrieves transcripts and existing summaries for a chosen Agent Copilot configuration, helps you author business requirements and test cases, runs repeatable evaluations with scoring rubrics, and reports on where a prompt succeeds or fails. You then iterate on the prompt and deploy an approved candidate back to the summary configuration, with the replaced version retained so you can roll back. The whole pipeline is driven in natural language from within Cursor or Kiro.
+
+![Flowchart](blueprint/images/flowchart.png "Copilot Summary Optimizer flowchart")
+
+The sections below cover installation and day-to-day use. For the full solution walkthrough, including prerequisites, OAuth scopes, and implementation steps, see the [blueprint article](https://developer.genesys.cloud/blueprints/copilot-summary-optimizer-mcp-blueprint/ "Goes to the Copilot Summary Optimizer blueprint page").
 
 ---
+
 
 ## Install
 
